@@ -58,7 +58,18 @@ class MoGe3SfMConfig:
     sequential_window: int = 30        # match each frame to +/- N neighbours (wide → robust chain)
     use_retrieval: bool = True         # retrieval loop closure (helps coverage)
 
-    # --- pairwise pose + global alignment ---
+    # --- pose engine ---
+    # 'icp': chain point-to-plane ICP of consecutive MoGe metric clouds (frame->previous,
+    #        accumulated from frame 0), then global BA removes drift. Simple + robust on a
+    #        continuous walk; needs no cross-image matching for the init.
+    # 'pose_graph': pairwise 3D correspondences (from matches) -> global pose graph. Fragile
+    #        on small-baseline video (cameras collapse); kept for non-sequential captures.
+    pose_engine: str = "icp"
+    icp_voxel: float = 0.03            # metres — voxel-downsample each cloud before ICP
+    icp_max_corr_dist: float = 0.30    # metres — ICP correspondence radius (coarse pass; fine = /6)
+    icp_max_iter: int = 60
+
+    # --- pairwise pose + global alignment (pose_graph engine only) ---
     # 'rigid': MoGe-3 is metric (scale baked in), so per-image scale drift is small and BA
     # on 2D reprojection makes the final model scale-consistent regardless of the init. Also
     # avoids a utils3d_moge bug in solve_pose(mode='similar') — s*R fails to broadcast
@@ -322,6 +333,90 @@ def _global_poses(num_nodes: int, edges, moments, cfg) -> np.ndarray:
 
 
 # ----------------------------------------------------------------------------
+# Pose engine 2: ICP odometry on MoGe metric clouds
+# ----------------------------------------------------------------------------
+
+def _lift_frame(points, mask, rgb, kp, cfg, rng) -> "_FrameGeom":
+    """Compact per-frame geometry (keypoint 3D + fusion subsample) — the ICP and pose-graph
+    engines both need this for triangulation/BA/fallback. `points` is MoGe's (ph,pw,3)."""
+    h, w = rgb.shape[:2]
+    ph, pw = points.shape[:2]
+    sx, sy = pw / w, ph / h
+    kx = np.clip(np.round(kp[:, 0] * sx).astype(int), 0, pw - 1)
+    ky = np.clip(np.round(kp[:, 1] * sy).astype(int), 0, ph - 1)
+    kp3d = points[ky, kx]
+    kp_valid = mask[ky, kx] & np.isfinite(kp3d).all(-1)
+    kp_rgb = rgb[np.clip(kp[:, 1].astype(int), 0, h - 1), np.clip(kp[:, 0].astype(int), 0, w - 1)]
+    vy, vx = np.nonzero(mask & np.isfinite(points).all(-1))
+    if vy.size:
+        sel = rng.choice(vy.size, min(cfg.fuse_per_frame, vy.size), replace=False)
+        fy, fx = vy[sel], vx[sel]
+        fuse_xyz = points[fy, fx].astype(np.float32)
+        fuse_rgb = rgb[np.clip((fy / sy).astype(int), 0, h - 1), np.clip((fx / sx).astype(int), 0, w - 1)]
+    else:
+        fuse_xyz, fuse_rgb = np.zeros((0, 3), np.float32), np.zeros((0, 3), np.uint8)
+    return kp3d, kp_valid, kp_rgb.astype(np.uint8), fuse_xyz, fuse_rgb.astype(np.uint8)
+
+
+def _icp_odometry(image_paths, kpts, cfg: MoGe3SfMConfig):
+    """MoGe-3 inference + ICP odometry: chain point-to-plane ICP of consecutive metric clouds
+    (frame i registered to frame i-1) into cam_from_world poses, accumulated from frame 0.
+    Returns (geoms, poses_w2c (N,4,4)). Streaming — only the previous cloud is kept."""
+    import torch
+    import open3d as o3d
+    from moge.model import import_model_class_by_version
+    import utils3d_moge as u3d
+
+    device = torch.device(cfg.device)
+    model = (import_model_class_by_version(cfg.moge_version)
+             .from_pretrained(_resolve_moge_pretrained(cfg)).to(device).eval())
+    rng = np.random.default_rng(0)
+
+    def to_pcd(points, mask):
+        pts = points[mask & np.isfinite(points).all(-1)].astype(np.float64)
+        pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
+        pcd = pcd.voxel_down_sample(cfg.icp_voxel)
+        pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=cfg.icp_voxel * 3, max_nn=30))
+        return pcd
+
+    geoms: list[_FrameGeom] = []
+    poses: list[np.ndarray] = []
+    prev_pcd = None
+    cfw = np.eye(4)                      # cam_from_world of the previous frame (frame 0 = world)
+    for i, q in enumerate(image_paths):
+        rgb = np.array(Image.open(q).convert("RGB"))
+        t = torch.tensor(rgb / 255.0, dtype=torch.float32, device=device).permute(2, 0, 1)
+        with torch.no_grad():
+            pred = model.infer(t)
+        points = pred["points"].float().cpu().numpy()
+        mask = (pred["mask"].cpu().numpy().astype(bool) if "mask" in pred
+                else np.isfinite(points).all(-1))
+        K = u3d.np.denormalize_intrinsics(pred["intrinsics"].cpu().numpy(), (rgb.shape[1], rgb.shape[0]))
+        kp3d, kp_valid, kp_rgb, fuse_xyz, fuse_rgb = _lift_frame(points, mask, rgb, kpts[i], cfg, rng)
+        geoms.append(_FrameGeom(q.name, (rgb.shape[1], rgb.shape[0]), K,
+                                kp3d, kp_valid, kp_rgb, fuse_xyz, fuse_rgb))
+
+        pcd = to_pcd(points, mask)
+        if prev_pcd is not None:
+            # ICP source=frame i, target=frame i-1: T maps frame-i coords -> frame-(i-1) coords.
+            # Coarse then fine correspondence radius; identity init (small inter-frame motion).
+            T = np.eye(4)
+            for dist in (cfg.icp_max_corr_dist, cfg.icp_max_corr_dist / 6.0):
+                reg = o3d.pipelines.registration.registration_icp(
+                    pcd, prev_pcd, dist, T,
+                    o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                    o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=cfg.icp_max_iter))
+                T = reg.transformation
+            cfw = np.linalg.inv(np.asarray(T)) @ cfw
+        poses.append(cfw.copy())
+        prev_pcd = pcd
+        if (i + 1) % 50 == 0:
+            print(f"[moge3-sfm] MoGe inference + ICP {i + 1}/{len(image_paths)}")
+    print(f"[moge3-sfm] ICP odometry done: {len(geoms)} frames")
+    return geoms, np.stack(poses)
+
+
+# ----------------------------------------------------------------------------
 # COLMAP model: poses + points3D, optional bundle adjustment, export
 # ----------------------------------------------------------------------------
 
@@ -413,32 +508,30 @@ def _largest_component(edges, num_nodes: int) -> list[int]:
     return sorted(max(comps.values(), key=len))
 
 
-def run_moge3_sfm(image_dir: Path, output_dir: Path, cfg: MoGe3SfMConfig | None = None):
-    """MoGe-3 metric SfM → COLMAP sparse/0. See module docstring for the pipeline."""
+def _matches_to_kept(pairs, matches_h5, geoms, name_to_idx, cfg):
+    """Per-pair inlier keypoint indices (kept for BA triangulation) straight from the matches,
+    keeping only correspondences with valid MoGe 3D on both sides. No 3D-3D pose filtering —
+    triangulation-angle + cheirality + reprojection filtering in bundle_adjust handles outliers."""
+    from hloc.utils.io import get_matches
+    kept: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
+    for a, b in pairs:
+        ia, ib = name_to_idx[a], name_to_idx[b]
+        m, _ = get_matches(matches_h5, a, b)
+        if m.shape[0] < cfg.min_pair_inliers:
+            continue
+        v = geoms[ia].kp_valid[m[:, 0]] & geoms[ib].kp_valid[m[:, 1]]
+        if v.sum() < cfg.min_pair_inliers:
+            continue
+        kept[(ia, ib)] = (m[v, 0], m[v, 1])
+    return kept
+
+
+def _pose_graph_engine(image_paths, kpts, matches, pairs, name_to_idx, cfg):
+    """Pose init from pairwise 3D correspondences + global pose graph (largest component)."""
     import torch
-
-    cfg = cfg or MoGe3SfMConfig()
-    image_dir = Path(image_dir).resolve()
-    output_dir = Path(output_dir).resolve()
-
-    image_paths = _sorted_images(image_dir)
-    if not image_paths:
-        raise RuntimeError(f"no .jpg/.png images in {image_dir}")
-    names = [p.name for p in image_paths]
-    name_to_idx = {n: i for i, n in enumerate(names)}
-
-    # hloc first (keypoints), THEN MoGe inference+lift — so each frame's full point map
-    # is freed immediately (only compact per-keypoint 3D is kept; see _FrameGeom).
-    features, matches, pairs = _run_hloc(image_dir, output_dir / "hloc", names, cfg)
-
-    from hloc.utils.io import get_keypoints
-    kpts = [get_keypoints(features, n) for n in names]      # per-image (Ki,2) pixels, index==id
-
     geoms = _infer_and_lift(image_paths, kpts, cfg)
     edges, moments, kept = _build_edges(pairs, matches, geoms, name_to_idx, cfg)
-
-    # Keep only the largest connected component — disconnected frames have no gauge
-    # relative to node 0 and would collapse to the origin (fake "registered" cameras).
+    # Disconnected frames have no gauge relative to node 0 and would collapse to the origin.
     comp = _largest_component(edges, len(geoms))
     inset = set(comp)
     if len(comp) < len(geoms):
@@ -451,21 +544,47 @@ def run_moge3_sfm(image_dir: Path, output_dir: Path, cfg: MoGe3SfMConfig | None 
     geoms = [geoms[i] for i in comp]
     kpts = [kpts[i] for i in comp]
     kept = {(remap[a], remap[b]): v for (a, b), v in kept.items() if a in inset and b in inset}
-
     poses_w2c = _global_poses(len(geoms), edges, moments, cfg)
+    return geoms, kpts, kept, poses_w2c
+
+
+def run_moge3_sfm(image_dir: Path, output_dir: Path, cfg: MoGe3SfMConfig | None = None):
+    """MoGe-3 metric SfM → COLMAP sparse/0. See module docstring for the pipeline."""
+    cfg = cfg or MoGe3SfMConfig()
+    image_dir = Path(image_dir).resolve()
+    output_dir = Path(output_dir).resolve()
+
+    image_paths = _sorted_images(image_dir)
+    if not image_paths:
+        raise RuntimeError(f"no .jpg/.png images in {image_dir}")
+    names = [p.name for p in image_paths]
+    name_to_idx = {n: i for i, n in enumerate(names)}
+
+    # hloc gives the 2D matches BA triangulates (both engines); MoGe supplies the geometry.
+    features, matches, pairs = _run_hloc(image_dir, output_dir / "hloc", names, cfg)
+    from hloc.utils.io import get_keypoints
+    kpts = [get_keypoints(features, n) for n in names]
+
+    if cfg.pose_engine == "icp":
+        geoms, poses_w2c = _icp_odometry(image_paths, kpts, cfg)
+        kept = _matches_to_kept(pairs, matches, geoms, name_to_idx, cfg)
+    elif cfg.pose_engine == "pose_graph":
+        geoms, kpts, kept, poses_w2c = _pose_graph_engine(
+            image_paths, kpts, matches, pairs, name_to_idx, cfg)
+    else:
+        raise ValueError(f"unknown pose_engine {cfg.pose_engine!r} (want 'icp' | 'pose_graph')")
+
     cam = _shared_pinhole_camera(geoms)
     recon = _base_reconstruction(geoms, poses_w2c, cam)
 
     ba_ok = False
     if cfg.bundle_adjust:
-        # Triangulate inlier tracks at the pose-graph poses, then robust pycolmap BA
-        # refines poses + points on 2D reprojection (corrects MoGe depth bias).
+        # Triangulate tracks at the init poses, then robust pycolmap BA refines poses + points
+        # on 2D reprojection (removes odometry drift; corrects MoGe depth bias).
         from moge.sfm.bundle_adjust import triangulate_and_ba
         ba_ok = triangulate_and_ba(recon, geoms, kpts, kept, cfg)
         if not ba_ok:
-            # BA diverged: rebuild at the (unrefined but coherent) pose-graph poses and
-            # seed points3D from MoGe fusion, so we still ship a usable model.
-            print("[moge3-sfm] falling back to pose-graph poses + MoGe point fusion")
+            print("[moge3-sfm] BA unusable — falling back to init poses + MoGe point fusion")
             recon = _base_reconstruction(geoms, poses_w2c, cam)
     if not ba_ok:
         _fuse_moge_points(recon, geoms, poses_w2c, cfg)

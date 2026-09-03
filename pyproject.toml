@@ -51,6 +51,7 @@ sfm = [
   "pycolmap==4.0.4",
   "kornia>=0.7",
   "h5py>=3.0",
+  "open3d>=0.18",
   "hloc @ git+https://github.com/cvg/Hierarchical-Localization.git",
   "lightglue @ git+https://github.com/cvg/LightGlue.git",
 ]
