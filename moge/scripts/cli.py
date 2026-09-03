@@ -13,13 +13,14 @@ def cli():
     pass
 
 def main():
-    from moge.scripts import app, infer, infer_baseline, infer_panorama, eval_baseline, vis_data
+    from moge.scripts import app, infer, infer_baseline, infer_panorama, eval_baseline, vis_data, sfm
     cli.add_command(app.main, name='app')
     cli.add_command(infer.main, name='infer')
     cli.add_command(infer_baseline.main, name='infer_baseline')
     cli.add_command(infer_panorama.main, name='infer_panorama')
     cli.add_command(eval_baseline.main, name='eval_baseline')
     cli.add_command(vis_data.main, name='vis_data')
+    cli.add_command(sfm.main, name='sfm')
     cli()
 
 

@@ -46,6 +46,14 @@ train = [
   "tensorboard>=2.14",
   "mlflow>=3.1.1",
 ]
+# Structure-from-Motion (moge sfm). All permissive licences — see moge/sfm/__init__.py.
+sfm = [
+  "pycolmap==4.0.4",
+  "kornia>=0.7",
+  "h5py>=3.0",
+  "hloc @ git+https://github.com/cvg/Hierarchical-Localization.git",
+  "lightglue @ git+https://github.com/cvg/LightGlue.git",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
