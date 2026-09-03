@@ -68,6 +68,8 @@ class MoGe3SfMConfig:
     icp_voxel: float = 0.03            # metres — voxel-downsample each cloud before ICP
     icp_max_corr_dist: float = 0.30    # metres — ICP correspondence radius (coarse pass; fine = /6)
     icp_max_iter: int = 60
+    icp_min_fitness: float = 0.30      # reject ICP below this overlap fitness -> constant-velocity coast
+    icp_max_motion: float = 1.00       # metres — reject implausibly large inter-frame motion
 
     # --- pairwise pose + global alignment (pose_graph engine only) ---
     # 'rigid': MoGe-3 is metric (scale baked in), so per-image scale drift is small and BA
@@ -237,6 +239,12 @@ def _run_hloc(image_dir: Path, work_dir: Path, image_names: list[str], cfg: MoGe
 
     # Retrieval (NetVLAD) loop pairs.
     if cfg.use_retrieval:
+        # Retrieval finds revisited places (loop-closure pairs) so BA can undo drift. OpenIBL
+        # loads its weights via torch.hub, which refuses an "untrusted" repo non-interactively;
+        # force trust_repo=True (we control the repo) so it runs headless.
+        import torch.hub as _hub
+        _orig_load = _hub.load
+        _hub.load = lambda *a, **k: _orig_load(*a, **{"trust_repo": True, **k})
         retr_conf = extract_features.confs[cfg.retrieval_conf]
         retr_desc = extract_features.main(retr_conf, image_dir, work_dir)
         retr_pairs = work_dir / "pairs_retrieval.txt"
@@ -383,6 +391,8 @@ def _icp_odometry(image_paths, kpts, cfg: MoGe3SfMConfig):
     poses: list[np.ndarray] = []
     prev_pcd = None
     cfw = np.eye(4)                      # cam_from_world of the previous frame (frame 0 = world)
+    prev_rel = np.eye(4)                 # last ACCEPTED frame_i->frame_{i-1} transform (constant-velocity prior)
+    n_fallback = 0
     for i, q in enumerate(image_paths):
         rgb = np.array(Image.open(q).convert("RGB"))
         t = torch.tensor(rgb / 255.0, dtype=torch.float32, device=device).permute(2, 0, 1)
@@ -399,19 +409,29 @@ def _icp_odometry(image_paths, kpts, cfg: MoGe3SfMConfig):
         pcd = to_pcd(points, mask)
         if prev_pcd is not None:
             # ICP source=frame i, target=frame i-1: T maps frame-i coords -> frame-(i-1) coords.
-            # Coarse then fine correspondence radius; identity init (small inter-frame motion).
-            T = np.eye(4)
+            # Init from the previous accepted motion (constant velocity), coarse then fine radius.
+            T = prev_rel.copy()
+            reg = None
             for dist in (cfg.icp_max_corr_dist, cfg.icp_max_corr_dist / 6.0):
                 reg = o3d.pipelines.registration.registration_icp(
                     pcd, prev_pcd, dist, T,
                     o3d.pipelines.registration.TransformationEstimationPointToPlane(),
                     o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=cfg.icp_max_iter))
-                T = reg.transformation
-            cfw = np.linalg.inv(np.asarray(T)) @ cfw
+                T = np.asarray(reg.transformation)
+            # Gate: a bad registration (low overlap fitness or implausibly large motion) would jump
+            # this camera and, since odometry is a chain, everything downstream. Reject it and coast
+            # on the constant-velocity prior instead.
+            if reg.fitness < cfg.icp_min_fitness or np.linalg.norm(T[:3, 3]) > cfg.icp_max_motion:
+                T = prev_rel
+                n_fallback += 1
+            else:
+                prev_rel = T
+            cfw = np.linalg.inv(T) @ cfw
         poses.append(cfw.copy())
         prev_pcd = pcd
         if (i + 1) % 50 == 0:
             print(f"[moge3-sfm] MoGe inference + ICP {i + 1}/{len(image_paths)}")
+    print(f"[moge3-sfm] ICP odometry: {n_fallback} constant-velocity fallbacks (bad/implausible ICP)")
     print(f"[moge3-sfm] ICP odometry done: {len(geoms)} frames")
     return geoms, np.stack(poses)
 
