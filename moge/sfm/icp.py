@@ -50,7 +50,8 @@ def _icp_odometry(image_paths, kpts, cfg: MoGe3SfMConfig):
         points = pred["points"].float().cpu().numpy()
         mask = (pred["mask"].cpu().numpy().astype(bool) if "mask" in pred
                 else np.isfinite(points).all(-1))
-        K = u3d.np.denormalize_intrinsics(pred["intrinsics"].cpu().numpy(), (rgb.shape[1], rgb.shape[0]))
+        # (height, width) order — rgb.shape[:2] is already (H, W); do NOT pass (W, H) (transposes K).
+        K = u3d.np.denormalize_intrinsics(pred["intrinsics"].cpu().numpy(), (rgb.shape[0], rgb.shape[1]))
         kp3d, kp_valid, kp_rgb, fuse_xyz, fuse_rgb = _lift_frame(points, mask, rgb, kpts[i], cfg, rng)
         geoms.append(_FrameGeom(q.name, (rgb.shape[1], rgb.shape[0]), K,
                                 kp3d, kp_valid, kp_rgb, fuse_xyz, fuse_rgb))

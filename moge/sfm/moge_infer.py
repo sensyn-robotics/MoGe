@@ -104,7 +104,9 @@ def _infer_and_lift(image_paths, kpts, cfg: MoGe3SfMConfig) -> list[_FrameGeom]:
         points = pred["points"].float().cpu().numpy()            # (ph,pw,3) metric cam frame
         mask = (pred["mask"].cpu().numpy().astype(bool)
                 if "mask" in pred else np.isfinite(points).all(-1))
-        K = u3d.np.denormalize_intrinsics(pred["intrinsics"].cpu().numpy(), (w, h))
+        # denormalize_intrinsics wants size as (height, width); passing (w, h) transposes
+        # the intrinsics (swaps fx/fy and cx/cy) and produces a broken camera.
+        K = u3d.np.denormalize_intrinsics(pred["intrinsics"].cpu().numpy(), (h, w))
         ph, pw = points.shape[:2]
         sx, sy = pw / w, ph / h
 
