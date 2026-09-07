@@ -88,11 +88,26 @@ def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3
     edges, CYX, CXX, CYY, MX, MY, W = [], [], [], [], [], [], []
 
     def add_edge(a, b, x, y):
-        xt = torch.tensor(np.asarray(x), dtype=torch.float64)[None]
-        yt = torch.tensor(np.asarray(y), dtype=torch.float64)[None]
-        cyx, cxx, cyy, mx, my, w = u3d.pt.pose_graph_edge_moments(xt, yt)
+        # Sanitize correspondences before building moments: MoGe points seen through
+        # windows/doorways have huge (finite) depths whose extreme per-edge scale ratio makes the
+        # Sim3 GNC solve diverge to NaN (linalg.svd on non-finite). Keep finite points within a
+        # robust radius in BOTH frames, and skip the edge if its moments come out non-finite.
+        x = np.asarray(x, dtype=np.float64); y = np.asarray(y, dtype=np.float64)
+        dx = np.linalg.norm(x, axis=1); dy = np.linalg.norm(y, axis=1)
+        fin = np.isfinite(dx) & np.isfinite(dy)
+        if fin.sum() < 6:
+            return False
+        ok = fin & (dx < 8.0 * np.median(dx[fin])) & (dy < 8.0 * np.median(dy[fin]))
+        if ok.sum() < 6:
+            return False
+        moms = u3d.pt.pose_graph_edge_moments(
+            torch.tensor(x[ok])[None], torch.tensor(y[ok])[None])
+        if not all(torch.isfinite(t).all() for t in moms):
+            return False
         edges.append([a, b])
-        CYX.append(cyx); CXX.append(cxx); CYY.append(cyy); MX.append(mx); MY.append(my); W.append(w)
+        for lst, t in zip((CYX, CXX, CYY, MX, MY, W), moms):
+            lst.append(t)
+        return True
 
     # 1) MoGe inference -> compact geom + camera-frame up; STREAM odometry edges (only the
     #    previous downsampled cloud is kept). Point-to-point ICP WITH scaling gives a Sim3 that
@@ -135,7 +150,11 @@ def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3
                 # no overlap found: weak identity prior keeps the odometry chain connected.
                 pts = np.asarray(prev_pcd.points)[:20]
                 xa, yb = pts, pts.copy()
-            add_edge(i - 1, i, xa, yb)
+            if not add_edge(i - 1, i, xa, yb):
+                # sanitizer dropped it (too few finite/near points): fall back to an identity prior
+                # so the odometry chain stays connected (a disconnected node collapses to the gauge).
+                pts = np.asarray(prev_pcd.points)[:50]
+                add_edge(i - 1, i, pts, pts.copy())
             n_odo += 1
         prev_pcd = pcd
         if (i + 1) % 50 == 0:
@@ -154,8 +173,8 @@ def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3
         v = geoms[ia].kp_valid[m[:, 0]] & geoms[ib].kp_valid[m[:, 1]]
         if v.sum() < cfg.min_loop_inliers:
             continue
-        add_edge(ia, ib, geoms[ia].kp3d[m[v, 0]], geoms[ib].kp3d[m[v, 1]])
-        n_loop += 1
+        if add_edge(ia, ib, geoms[ia].kp3d[m[v, 0]], geoms[ib].kp3d[m[v, 1]]):
+            n_loop += 1
     print(f"[moge3-sfm] {n_odo} odometry + {n_loop} loop edges")
     if not edges:
         raise RuntimeError("[moge3-sfm] no pose-graph edges — matching/ICP failed.")
