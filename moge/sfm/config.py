@@ -25,17 +25,25 @@ class MoGe3SfMConfig:
     use_retrieval: bool = True         # retrieval loop closure (helps coverage)
 
     # --- pose engine ---
-    # 'icp': chain point-to-plane ICP of consecutive MoGe metric clouds (frame->previous,
-    #        accumulated from frame 0), then global BA removes drift. Simple + robust on a
-    #        continuous walk; needs no cross-image matching for the init.
-    # 'pose_graph': pairwise 3D correspondences (from matches) -> global pose graph. Fragile
-    #        on small-baseline video (cameras collapse); kept for non-sequential captures.
+    # 'icp': globally-optimized ICP POSE GRAPH. Consecutive-frame ICP = odometry edges +
+    #        retrieval loop-closure edges (3D-3D-initialised, ICP-refined) -> Open3D global
+    #        optimization (robust line process closes loops, spreads drift, rejects bad edges)
+    #        -> gravity align (rotate so MoGe floor-normal = up, enforcing the planar-room prior).
+    #        Replaces pure odometry chaining, which drifted into a collapsed, non-planar blob.
+    # 'pose_graph': pairwise 3D correspondences only -> global pose graph. Fragile on small
+    #        baselines (cameras collapse); kept for non-sequential captures.
     pose_engine: str = "icp"
     icp_voxel: float = 0.03            # metres — voxel-downsample each cloud before ICP
     icp_max_corr_dist: float = 0.30    # metres — ICP correspondence radius (coarse pass; fine = /6)
     icp_max_iter: int = 60
-    icp_min_fitness: float = 0.30      # reject ICP below this overlap fitness -> constant-velocity coast
-    icp_max_motion: float = 1.00       # metres — reject implausibly large inter-frame motion
+    icp_min_fitness: float = 0.30      # odometry edge below this overlap fitness -> low-weight edge
+
+    # --- pose-graph loop closure + global optimization (icp engine) ---
+    min_loop_inliers: int = 30         # 3D-3D match inliers required to attempt a loop edge
+    icp_loop_min_fitness: float = 0.40 # keep a loop edge only above this ICP overlap fitness
+    icp_loop_max_rmse: float = 0.08    # metres — and below this ICP inlier RMSE (reject bad loops)
+    posegraph_prune_threshold: float = 0.25  # Open3D line-process edge-prune threshold
+    gravity_align: bool = True         # rotate the solved scene so averaged MoGe floor-normal = world up
 
     # --- pairwise pose + global alignment (pose_graph engine only) ---
     # 'rigid': MoGe-3 is metric (scale baked in), so per-image scale drift is small and BA

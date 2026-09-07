@@ -36,7 +36,7 @@ from pathlib import Path
 # Re-exported so `from moge.sfm.pipeline import MoGe3SfMConfig, load_config` keeps working.
 from moge.sfm.config import MoGe3SfMConfig, load_config
 from moge.sfm.matching import _matches_to_kept, _run_hloc
-from moge.sfm.icp import _icp_odometry
+from moge.sfm.icp import _icp_posegraph
 from moge.sfm.pose_graph import _pose_graph_engine
 from moge.sfm.colmap_export import (
     _base_reconstruction,
@@ -73,7 +73,7 @@ def run_moge3_sfm(image_dir: Path, output_dir: Path, cfg: MoGe3SfMConfig | None 
     kpts = [get_keypoints(features, n) for n in names]
 
     if cfg.pose_engine == "icp":
-        geoms, poses_w2c = _icp_odometry(image_paths, kpts, cfg)
+        geoms, poses_w2c = _icp_posegraph(image_paths, kpts, matches, pairs, name_to_idx, cfg)
         kept = _matches_to_kept(pairs, matches, geoms, name_to_idx, cfg)
     elif cfg.pose_engine == "pose_graph":
         geoms, kpts, kept, poses_w2c = _pose_graph_engine(

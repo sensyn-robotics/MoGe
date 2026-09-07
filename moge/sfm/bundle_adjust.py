@@ -155,4 +155,17 @@ def triangulate_and_ba(recon, geoms, kpts, kept: dict, cfg) -> bool:
     if not np.isfinite(err) or err > _DIVERGED_REPROJ_PX or recon.num_points3D() < 8:
         print(f"[moge3-sfm] BA diverged (err {err:.1f}px) — caller falls back to pose-graph poses")
         return False
+
+    # Per-camera guard: mean reprojection can stay ~1px while BA flings a weakly-constrained
+    # camera thousands of metres out (its own wrong tracks are self-consistent). A globally
+    # optimized init shouldn't allow that, so if any center is an extreme spatial outlier vs the
+    # robust bulk, distrust BA and fall back to the pose-graph poses (now globally consistent).
+    Cba = np.stack(_centers([np.asarray(recon.image(i + 1).cam_from_world().matrix())
+                             for i in range(n)]))
+    d = np.linalg.norm(Cba - np.median(Cba, 0), axis=1)
+    r90 = float(np.percentile(d, 90)) + 1e-6
+    if float(d.max()) > 20.0 * r90:
+        print(f"[moge3-sfm] BA per-camera guard: a camera is {d.max():.0f}m out "
+              f"(bulk r90 {r90:.1f}m) — falling back to pose-graph poses")
+        return False
     return True
