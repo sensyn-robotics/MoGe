@@ -1,20 +1,18 @@
-"""Pose engine 1: globally-optimized ICP pose graph on MoGe metric clouds.
+"""Pose engine 1: scale-aware (Sim3) pose graph on MoGe metric clouds.
 
-Chained ICP odometry accumulates unbounded rotation + scale drift — indoor planar
-scenes give point-to-plane ICP a sliding ambiguity, so pure odometry collapsed into a
-non-planar blob (cameras spanning tens of metres, some flung km away). This engine builds
-a POSE GRAPH instead:
+MoGe's per-frame *metric scale* drifts wildly (observed 0.44-5.9x across one room), so a
+rigid SE(3) approach — chained odometry or an SE(3) pose graph — cannot recover a coherent
+metric room: it collapses or balloons (tens of metres, non-planar). This engine builds a
+**Sim3** pose graph whose nodes carry a per-frame scale, solved by utils3d's robust
+GNC-TLS optimizer (validated: recovers per-node scale to 1e-15 and rejects wrong edges):
 
-  * odometry edges: consecutive-frame ICP (trusted),
-  * loop-closure edges: retrieval pairs, initialised from learned-match 3D-3D poses and
-    ICP-refined, kept only when the registration is confident,
-  * Open3D global optimization: Levenberg-Marquardt + a robust line process that closes
-    loops, distributes drift, and rejects wrong loop edges,
-  * gravity align: rotate the solved scene so the averaged MoGe floor-normal points up,
-    enforcing the room's planar-floor prior.
-
-Returns per-frame `_FrameGeom` + globally-consistent cam_from_world poses; downstream BA
-only polishes (with a per-camera divergence guard in bundle_adjust)."""
+  * odometry edges (consecutive frames): point-to-point ICP WITH scaling aligns across the
+    per-frame scale; its dense inlier correspondences are well-conditioned even at the cm
+    baselines that made sparse-match 3D-3D collapse. Streamed (only the previous cloud kept).
+  * loop-closure edges (retrieval pairs): learned-match correspondences lifted to MoGe 3D.
+  * GNC 'similar': per-node rotation+translation+SCALE, with GNC-TLS rejecting outlier edges.
+  * fold Sim3 -> metric cam_from_world (R, t/s) in node 0's scale gauge, then gravity-align
+    (rotate so the averaged MoGe floor-normal points up) to enforce the planar-room prior."""
 
 from __future__ import annotations
 
@@ -29,9 +27,7 @@ def _to_pcd(points, mask, voxel):
     import open3d as o3d
     pts = points[mask & np.isfinite(points).all(-1)].astype(np.float64)
     pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
-    pcd = pcd.voxel_down_sample(voxel)
-    pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=voxel * 3, max_nn=30))
-    return pcd
+    return pcd.voxel_down_sample(voxel)
 
 
 def _up_from_normals(normal, mask):
@@ -44,48 +40,16 @@ def _up_from_normals(normal, mask):
     if n.shape[0] < 50:
         return None
     n /= np.linalg.norm(n, axis=1, keepdims=True) + 1e-9
-    w, V = np.linalg.eigh(n.T @ n)
+    _, V = np.linalg.eigh(n.T @ n)
     v = V[:, -1]
     return v if v[1] < 0 else -v          # y<0 == upward in the OpenCV camera frame
-
-
-def _pairwise_icp(src, tgt, init, max_corr, max_iter):
-    import open3d as o3d
-    r = o3d.pipelines.registration
-    T = init
-    for dist in (max_corr, max_corr / 6.0):
-        reg = r.registration_icp(src, tgt, dist, T,
-                                 r.TransformationEstimationPointToPlane(),
-                                 r.ICPConvergenceCriteria(max_iteration=max_iter))
-        T = np.asarray(reg.transformation)
-    info = r.get_information_matrix_from_point_clouds(src, tgt, max_corr / 6.0, T)
-    return T, info, reg.fitness, reg.inlier_rmse
-
-
-def _loop_init_3d3d(geom_a, geom_b, m, cfg, rng):
-    """Rough source(a)->target(b) transform from learned matches lifted to MoGe 3D
-    (robust rigid Umeyama/RANSAC). Returns 4x4 T or None if too few inliers."""
-    import utils3d_moge as u3d
-    va, vb = geom_a.kp_valid[m[:, 0]], geom_b.kp_valid[m[:, 1]]
-    v = va & vb
-    if v.sum() < cfg.min_loop_inliers:
-        return None
-    pa, pb = geom_a.kp3d[m[v, 0]], geom_b.kp3d[m[v, 1]]
-    pose, inl = u3d.np.solve_pose_ransac(pa, pb, mode="rigid",
-                                         threshold=cfg.ransac_threshold, rng=rng)
-    if inl.sum() < cfg.min_loop_inliers:
-        return None
-    T = np.eye(4)
-    T[:3, :3], T[:3, 3] = pose[:3, :3], pose[:3, 3]
-    return T
 
 
 def _gravity_align(poses_w2c, up_cam, valid):
     """Rotate the whole reconstruction so the averaged floor-normal is world +Z.
 
-    up_cam[i] is frame i's up in its camera frame; R_wc_i @ up_cam_i is it in world.
-    Average the valid ones, then rotate the gauge so that mean up = +Z (a horizontal
-    floor / near-planar trajectory). Purely a global re-gauge — leaves residuals to BA."""
+    up_cam[i] is frame i's up in its camera frame; R_wc_i @ up_cam_i is it in world. Average
+    the valid ones, rotate the gauge so mean up = +Z (horizontal floor / near-planar walk)."""
     ups = [np.linalg.inv(poses_w2c[i])[:3, :3] @ up_cam[i]
            for i in range(len(poses_w2c)) if valid[i]]
     if not ups:
@@ -100,14 +64,14 @@ def _gravity_align(poses_w2c, up_cam, valid):
     axis /= s
     ang = np.arctan2(s, np.dot(g, z))
     K = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
-    R = np.eye(3) + np.sin(ang) * K + (1 - np.cos(ang)) * K @ K   # world rotation g->+Z
+    R = np.eye(3) + np.sin(ang) * K + (1 - np.cos(ang)) * K @ K
     Rw = np.eye(4); Rw[:3, :3] = R
-    return [w2c @ np.linalg.inv(Rw) for w2c in poses_w2c]         # cam_from_world' = w2c @ inv(Rworld)
+    return [w2c @ np.linalg.inv(Rw) for w2c in poses_w2c]
 
 
 def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3SfMConfig):
-    """MoGe-3 inference + ICP pose graph (odometry + loop closure) + global optimization +
-    gravity align. Returns (geoms, poses_w2c (N,4,4))."""
+    """MoGe-3 inference + Sim3 pose graph (scale-aware) + gravity align. Returns
+    (geoms, poses_w2c (N,4,4))."""
     import torch
     import open3d as o3d
     from hloc.utils.io import get_matches
@@ -121,9 +85,23 @@ def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3
     rng = np.random.default_rng(0)
     n = len(image_paths)
 
-    # 1) per-frame: MoGe inference -> compact geom + downsampled cloud + camera-frame up.
+    edges, CYX, CXX, CYY, MX, MY, W = [], [], [], [], [], [], []
+
+    def add_edge(a, b, x, y):
+        xt = torch.tensor(np.asarray(x), dtype=torch.float64)[None]
+        yt = torch.tensor(np.asarray(y), dtype=torch.float64)[None]
+        cyx, cxx, cyy, mx, my, w = u3d.pt.pose_graph_edge_moments(xt, yt)
+        edges.append([a, b])
+        CYX.append(cyx); CXX.append(cxx); CYY.append(cyy); MX.append(mx); MY.append(my); W.append(w)
+
+    # 1) MoGe inference -> compact geom + camera-frame up; STREAM odometry edges (only the
+    #    previous downsampled cloud is kept). Point-to-point ICP WITH scaling gives a Sim3 that
+    #    aligns across the per-frame scale, and its dense correspondences feed the edge moments.
     geoms: list[_FrameGeom] = []
-    pcds, up_cam, depths = [], [], []
+    up_cam = []
+    est = r.TransformationEstimationPointToPoint(with_scaling=True)
+    prev_pcd, prev_rel = None, np.eye(4)
+    n_odo = 0
     for i, q in enumerate(image_paths):
         rgb = np.array(Image.open(q).convert("RGB"))
         t = torch.tensor(rgb / 255.0, dtype=torch.float32, device=device).permute(2, 0, 1)
@@ -137,55 +115,34 @@ def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3
         kp3d, kp_valid, kp_rgb, fuse_xyz, fuse_rgb = _lift_frame(points, mask, rgb, kpts[i], cfg, rng)
         geoms.append(_FrameGeom(q.name, (rgb.shape[1], rgb.shape[0]), K,
                                 kp3d, kp_valid, kp_rgb, fuse_xyz, fuse_rgb))
-        pcds.append(_to_pcd(points, mask, cfg.icp_voxel))
         up_cam.append(_up_from_normals(pred["normal"].cpu().numpy(), mask)
                       if "normal" in pred else None)
-        vp = points[mask & np.isfinite(points).all(-1)]
-        depths.append(float(np.median(np.linalg.norm(vp, axis=1))) if vp.size else np.nan)
+
+        pcd = _to_pcd(points, mask, cfg.icp_voxel)
+        if prev_pcd is not None:
+            T = prev_rel
+            reg = None
+            for dist in (cfg.icp_max_corr_dist, cfg.icp_max_corr_dist / 6.0):
+                reg = r.registration_icp(pcd, prev_pcd, dist, T, est,
+                                         r.ICPConvergenceCriteria(max_iteration=cfg.icp_max_iter))
+                T = np.asarray(reg.transformation)
+            corr = np.asarray(reg.correspondence_set)
+            if corr.shape[0] >= 3:
+                prev_rel = T
+                xa = np.asarray(prev_pcd.points)[corr[:, 1]]   # node i-1 frame
+                yb = np.asarray(pcd.points)[corr[:, 0]]        # node i frame
+            else:
+                # no overlap found: weak identity prior keeps the odometry chain connected.
+                pts = np.asarray(prev_pcd.points)[:20]
+                xa, yb = pts, pts.copy()
+            add_edge(i - 1, i, xa, yb)
+            n_odo += 1
+        prev_pcd = pcd
         if (i + 1) % 50 == 0:
-            print(f"[moge3-sfm] MoGe inference + cloud {i + 1}/{n}")
+            print(f"[moge3-sfm] MoGe inference + odometry {i + 1}/{n}")
 
-    # 1b) scale normalization: MoGe's per-frame metric scale drifts, so rigid ICP + pose graph
-    # can't fix it and the reconstruction balloons (~4x, tens of metres tall). Pin every frame to a
-    # common scale via its median point distance (robust, ~constant across a room walk) -> a
-    # scale-consistent, ~metric reconstruction that the SE(3) graph CAN keep coherent.
-    if cfg.scale_normalize:
-        d = np.array(depths); ref = float(np.nanmedian(d))
-        for i in range(n):
-            if not np.isfinite(d[i]) or d[i] < 1e-6:
-                continue
-            s = ref / d[i]
-            pcds[i].scale(s, center=(0.0, 0.0, 0.0))
-            geoms[i].kp3d = geoms[i].kp3d * s
-            geoms[i].fuse_xyz = (geoms[i].fuse_xyz * s).astype(np.float32)
-        sc = ref / d[np.isfinite(d) & (d > 1e-6)]
-        print(f"[moge3-sfm] scale-normalized to median depth {ref:.2f}m "
-              f"(per-frame scale {sc.min():.2f}-{sc.max():.2f})")
-
-    # 2) odometry edges (consecutive ICP), accumulate node init (cam->world = inv of w2c chain).
-    pg = r.PoseGraph()
-    pg.nodes.append(r.PoseGraphNode(np.eye(4)))
-    w2c_chain = np.eye(4)
-    prev_rel = np.eye(4)          # last accepted consecutive motion (constant-velocity prior)
-    n_weak = 0
-    for i in range(1, n):
-        # source=i-1, target=i so T = T_{cam_i <- cam_{i-1}} matches PoseGraphEdge(i-1, i, T)
-        # (Open3D reads edge.transformation as source->target). Init ICP from the last accepted motion.
-        T, info, fit, _ = _pairwise_icp(pcds[i - 1], pcds[i], prev_rel,
-                                        cfg.icp_max_corr_dist, cfg.icp_max_iter)
-        # Robust odometry: a bad consecutive ICP (low overlap / implausible jump) is still an
-        # uncertain=False backbone edge the line process can't reject, so it would enforce a jump.
-        # Coast on the constant-velocity prior and down-weight the edge so loops position the node.
-        if fit < cfg.icp_min_fitness or np.linalg.norm(T[:3, 3]) > cfg.icp_max_motion:
-            T = prev_rel; info = info * 0.05; n_weak += 1
-        else:
-            prev_rel = T
-        w2c_chain = T @ w2c_chain
-        pg.nodes.append(r.PoseGraphNode(np.linalg.inv(w2c_chain)))
-        pg.edges.append(r.PoseGraphEdge(i - 1, i, T, info, uncertain=False))
-    print(f"[moge3-sfm] {n - 1} odometry edges ({n_weak} weak/coasted)")
-
-    # 3) loop-closure edges from retrieval pairs (|i-j| beyond the sequential window).
+    # 2) loop-closure edges from retrieval pairs (beyond the sequential window): learned-match
+    #    correspondences lifted to MoGe 3D. GNC-TLS rejects the wrong ones, so no pre-gating.
     n_loop = 0
     for a, b in pairs:
         ia, ib = name_to_idx[a], name_to_idx[b]
@@ -194,33 +151,36 @@ def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3
         m, _ = get_matches(matches_h5, a, b)
         if m.shape[0] < cfg.min_loop_inliers:
             continue
-        init = _loop_init_3d3d(geoms[ia], geoms[ib], m, cfg, rng)
-        if init is None:
+        v = geoms[ia].kp_valid[m[:, 0]] & geoms[ib].kp_valid[m[:, 1]]
+        if v.sum() < cfg.min_loop_inliers:
             continue
-        T, info, fit, rmse = _pairwise_icp(pcds[ia], pcds[ib], init,
-                                           cfg.icp_max_corr_dist, cfg.icp_max_iter)
-        if fit < cfg.icp_loop_min_fitness or rmse > cfg.icp_loop_max_rmse:
-            continue
-        pg.edges.append(r.PoseGraphEdge(ia, ib, T, info, uncertain=True))
+        add_edge(ia, ib, geoms[ia].kp3d[m[v, 0]], geoms[ib].kp3d[m[v, 1]])
         n_loop += 1
-    print(f"[moge3-sfm] {n_loop} loop-closure edges kept")
+    print(f"[moge3-sfm] {n_odo} odometry + {n_loop} loop edges")
+    if not edges:
+        raise RuntimeError("[moge3-sfm] no pose-graph edges — matching/ICP failed.")
 
-    # 4) global optimization (robust line process closes loops + rejects bad edges).
-    # max_correspondence_distance must scale with the trajectory: too small (e.g. the ICP fine
-    # radius ~0.05m) makes the line process reject the large residuals of drifted loop edges, so
-    # NOTHING closes. Validated on synthetic loops (0.15*diag closes loops across 6-50m scales
-    # while still rejecting inconsistent loops). Diagonal from a robust (2-98%) node bbox.
-    init_C = np.stack([np.asarray(node.pose)[:3, 3] for node in pg.nodes])
-    diag = float(np.linalg.norm(np.percentile(init_C, 98, 0) - np.percentile(init_C, 2, 0)))
-    mcd = float(np.clip(0.15 * diag, 0.3, 3.0))
-    opt = r.GlobalOptimizationOption(
-        max_correspondence_distance=mcd,
-        edge_prune_threshold=cfg.posegraph_prune_threshold,
-        preference_loop_closure=1.0, reference_node=0)
-    with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
-        r.global_optimization(pg, r.GlobalOptimizationLevenbergMarquardt(),
-                              r.GlobalOptimizationConvergenceCriteria(), opt)
-    poses_w2c = [np.linalg.inv(np.asarray(node.pose)) for node in pg.nodes]
+    # 3) robust Sim3 global optimization (per-node rotation+translation+scale; GNC-TLS rejects
+    #    outlier edges). Returns world->node poses whose 3x3 block is s*R.
+    cat = torch.cat
+    poses, _ = u3d.pt.pose_graph_optimization_gnc(
+        n, torch.tensor(edges), cat(CYX, 0), cat(CXX, 0), cat(CYY, 0),
+        cat(MX, 0), cat(MY, 0), cat(W, 0),
+        mode="similar", threshold=cfg.ransac_threshold,
+        niter=cfg.pose_graph_niter, gnc_iters=cfg.gnc_iters)
+    poses = poses.detach().cpu().numpy()
+
+    # 4) fold Sim3 -> metric cam_from_world (R, t/s) in node 0's gauge; rescale each frame's MoGe
+    #    fusion points to that gauge so the BA-fallback fusion is scale-consistent.
+    poses_w2c = np.zeros((n, 4, 4))
+    for i in range(n):
+        sR = poses[i, :3, :3]
+        s = np.cbrt(max(np.linalg.det(sR), 1e-12))
+        poses_w2c[i] = np.eye(4)
+        poses_w2c[i, :3, :3] = sR / s
+        poses_w2c[i, :3, 3] = poses[i, :3, 3] / s
+        geoms[i].fuse_xyz = (geoms[i].fuse_xyz / s).astype(np.float32)
+    poses_w2c = list(poses_w2c)
 
     # 5) gravity align (rotate scene so averaged MoGe floor-normal = up -> planar room).
     if cfg.gravity_align and any(u is not None for u in up_cam):
@@ -228,5 +188,5 @@ def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3
         safe_up = [u if u is not None else np.array([0.0, -1.0, 0.0]) for u in up_cam]
         poses_w2c = _gravity_align(poses_w2c, safe_up, valid)
 
-    print(f"[moge3-sfm] pose graph optimized: {n} frames, {n_loop} loops")
+    print(f"[moge3-sfm] Sim3 pose graph optimized: {n} frames")
     return geoms, np.stack(poses_w2c)
