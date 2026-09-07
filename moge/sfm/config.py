@@ -36,7 +36,10 @@ class MoGe3SfMConfig:
     icp_voxel: float = 0.03            # metres — voxel-downsample each cloud before ICP
     icp_max_corr_dist: float = 0.30    # metres — ICP correspondence radius (coarse pass; fine = /6)
     icp_max_iter: int = 60
-    icp_min_fitness: float = 0.30      # odometry edge below this overlap fitness -> low-weight edge
+    icp_min_fitness: float = 0.30      # odometry edge below this overlap fitness -> low-weight + coast
+    icp_max_motion: float = 1.00       # metres — odometry translation above this -> coast + down-weight
+    scale_normalize: bool = True       # pin each MoGe cloud to a common scale (median depth) — MoGe's
+                                       # per-frame metric scale drifts, ballooning the rigid reconstruction
 
     # --- pose-graph loop closure + global optimization (icp engine) ---
     min_loop_inliers: int = 30         # 3D-3D match inliers required to attempt a loop edge

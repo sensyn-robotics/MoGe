@@ -123,7 +123,7 @@ def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3
 
     # 1) per-frame: MoGe inference -> compact geom + downsampled cloud + camera-frame up.
     geoms: list[_FrameGeom] = []
-    pcds, up_cam = [], []
+    pcds, up_cam, depths = [], [], []
     for i, q in enumerate(image_paths):
         rgb = np.array(Image.open(q).convert("RGB"))
         t = torch.tensor(rgb / 255.0, dtype=torch.float32, device=device).permute(2, 0, 1)
@@ -140,23 +140,50 @@ def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3
         pcds.append(_to_pcd(points, mask, cfg.icp_voxel))
         up_cam.append(_up_from_normals(pred["normal"].cpu().numpy(), mask)
                       if "normal" in pred else None)
+        vp = points[mask & np.isfinite(points).all(-1)]
+        depths.append(float(np.median(np.linalg.norm(vp, axis=1))) if vp.size else np.nan)
         if (i + 1) % 50 == 0:
             print(f"[moge3-sfm] MoGe inference + cloud {i + 1}/{n}")
+
+    # 1b) scale normalization: MoGe's per-frame metric scale drifts, so rigid ICP + pose graph
+    # can't fix it and the reconstruction balloons (~4x, tens of metres tall). Pin every frame to a
+    # common scale via its median point distance (robust, ~constant across a room walk) -> a
+    # scale-consistent, ~metric reconstruction that the SE(3) graph CAN keep coherent.
+    if cfg.scale_normalize:
+        d = np.array(depths); ref = float(np.nanmedian(d))
+        for i in range(n):
+            if not np.isfinite(d[i]) or d[i] < 1e-6:
+                continue
+            s = ref / d[i]
+            pcds[i].scale(s, center=(0.0, 0.0, 0.0))
+            geoms[i].kp3d = geoms[i].kp3d * s
+            geoms[i].fuse_xyz = (geoms[i].fuse_xyz * s).astype(np.float32)
+        sc = ref / d[np.isfinite(d) & (d > 1e-6)]
+        print(f"[moge3-sfm] scale-normalized to median depth {ref:.2f}m "
+              f"(per-frame scale {sc.min():.2f}-{sc.max():.2f})")
 
     # 2) odometry edges (consecutive ICP), accumulate node init (cam->world = inv of w2c chain).
     pg = r.PoseGraph()
     pg.nodes.append(r.PoseGraphNode(np.eye(4)))
     w2c_chain = np.eye(4)
+    prev_rel = np.eye(4)          # last accepted consecutive motion (constant-velocity prior)
+    n_weak = 0
     for i in range(1, n):
         # source=i-1, target=i so T = T_{cam_i <- cam_{i-1}} matches PoseGraphEdge(i-1, i, T)
-        # (Open3D reads edge.transformation as source->target). w2c_i = T @ w2c_{i-1}.
-        T, info, fit, _ = _pairwise_icp(pcds[i - 1], pcds[i], np.eye(4),
+        # (Open3D reads edge.transformation as source->target). Init ICP from the last accepted motion.
+        T, info, fit, _ = _pairwise_icp(pcds[i - 1], pcds[i], prev_rel,
                                         cfg.icp_max_corr_dist, cfg.icp_max_iter)
+        # Robust odometry: a bad consecutive ICP (low overlap / implausible jump) is still an
+        # uncertain=False backbone edge the line process can't reject, so it would enforce a jump.
+        # Coast on the constant-velocity prior and down-weight the edge so loops position the node.
+        if fit < cfg.icp_min_fitness or np.linalg.norm(T[:3, 3]) > cfg.icp_max_motion:
+            T = prev_rel; info = info * 0.05; n_weak += 1
+        else:
+            prev_rel = T
         w2c_chain = T @ w2c_chain
         pg.nodes.append(r.PoseGraphNode(np.linalg.inv(w2c_chain)))
-        # uncertain=False: odometry is trusted; low fitness only lowers its information weight.
         pg.edges.append(r.PoseGraphEdge(i - 1, i, T, info, uncertain=False))
-    print(f"[moge3-sfm] {n - 1} odometry edges")
+    print(f"[moge3-sfm] {n - 1} odometry edges ({n_weak} weak/coasted)")
 
     # 3) loop-closure edges from retrieval pairs (|i-j| beyond the sequential window).
     n_loop = 0
