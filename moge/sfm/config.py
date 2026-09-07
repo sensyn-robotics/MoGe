@@ -33,7 +33,8 @@ class MoGe3SfMConfig:
     # 'pose_graph': pairwise 3D correspondences only -> global pose graph. Fragile on small
     #        baselines (cameras collapse); kept for non-sequential captures.
     pose_engine: str = "icp"
-    icp_voxel: float = 0.03            # metres — voxel-downsample each cloud before ICP
+    icp_voxel: float = 0.03            # metres — voxel-downsample each cloud for the fine ICP refine
+    coarse_voxel: float = 0.15         # metres — coarse downsample (~1-2k pts) for FPFH + FGR global reg
     icp_max_corr_dist: float = 0.30    # metres — ICP correspondence radius (coarse pass; fine = /6)
     icp_max_iter: int = 60
     icp_min_fitness: float = 0.30      # odometry edge below this overlap fitness -> low-weight + coast
