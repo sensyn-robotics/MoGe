@@ -59,11 +59,24 @@ def _register_pair(cs, fs, ct, ft, fine_s, fine_t, cfg):
     fitness, rmse). FGR needs no initial pose, so this works for wide-baseline loop pairs too."""
     import open3d as o3d
     r = o3d.pipelines.registration
-    fgr = r.registration_fgr_based_on_feature_matching(
-        cs, ct, fs, ft,
-        r.FastGlobalRegistrationOption(maximum_correspondence_distance=cfg.coarse_voxel * 1.5))
     fine_dist = cfg.icp_max_corr_dist / 2.0
-    reg = r.registration_icp(fine_s, fine_t, fine_dist, np.asarray(fgr.transformation),
+    # FGR's internal RANSAC crashes on empty/near-empty clouds or zero feature matches
+    # ("low must be < high, got 0 and 0"). Guard + fall back to identity init: consecutive frames
+    # still align by ICP, and a loop pair that can't be globally registered just fails the gate.
+    Tinit = np.eye(4)
+    if len(cs.points) >= 20 and len(ct.points) >= 20:
+        try:
+            fgr = r.registration_fgr_based_on_feature_matching(
+                cs, ct, fs, ft,
+                r.FastGlobalRegistrationOption(maximum_correspondence_distance=cfg.coarse_voxel * 1.5))
+            Tf = np.asarray(fgr.transformation)
+            if Tf.shape == (4, 4) and np.isfinite(Tf).all():
+                Tinit = Tf
+        except Exception:
+            pass
+    if len(fine_s.points) < 10 or len(fine_t.points) < 10:
+        return Tinit, np.eye(6), 0.0, 1e9
+    reg = r.registration_icp(fine_s, fine_t, fine_dist, Tinit,
                              r.TransformationEstimationPointToPlane(),
                              r.ICPConvergenceCriteria(max_iteration=cfg.icp_max_iter))
     T = np.asarray(reg.transformation)
