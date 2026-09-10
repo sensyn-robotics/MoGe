@@ -150,16 +150,28 @@ def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3
         return _register_pair(coarse[a], fpfh[a], coarse[b], fpfh[b], fine[a], fine[b], cfg)
 
     # 2) odometry edges (consecutive), accumulate node init. source=i-1, target=i so
-    #    T = cam_i <- cam_{i-1} matches PoseGraphEdge(i-1, i, T).
+    #    T = cam_i <- cam_{i-1} matches PoseGraphEdge(i-1, i, T). GATE each consecutive
+    #    registration: a blurry / low-overlap / textureless frame yields a bad ICP that, trusted as
+    #    a confident edge, offsets the whole downstream node-init chain (and inflates drift so real
+    #    loops look like outliers). On failure, COAST the init through it (reuse the last accepted
+    #    relative motion — constant velocity) and add the edge as uncertain + heavily down-weighted,
+    #    letting loop closure + global optimization recover the pose instead of the bad edge.
     pg = r.PoseGraph()
     pg.nodes.append(r.PoseGraphNode(np.eye(4)))
     w2c = np.eye(4)
+    prev_T = np.eye(4)          # last accepted relative motion (constant-velocity coast)
+    n_bad_odo = 0
     for i in range(1, n):
         T, info, fit, _ = register(i - 1, i)
+        good = fit >= cfg.icp_min_fitness and float(np.linalg.norm(T[:3, 3])) <= cfg.icp_max_motion
+        if good:
+            prev_T = T
+        else:
+            T, info, n_bad_odo = prev_T, info * 1e-2, n_bad_odo + 1
         w2c = T @ w2c
         pg.nodes.append(r.PoseGraphNode(np.linalg.inv(w2c)))
-        pg.edges.append(r.PoseGraphEdge(i - 1, i, T, info, uncertain=False))
-    print(f"[moge3-sfm] {n - 1} odometry edges")
+        pg.edges.append(r.PoseGraphEdge(i - 1, i, T, info, uncertain=not good))
+    print(f"[moge3-sfm] {n - 1} odometry edges ({n_bad_odo} coasted/down-weighted)")
 
     # 3) loop-closure edges from retrieval pairs, kept only when the registration is confident.
     n_loop = 0
@@ -174,17 +186,23 @@ def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3
         n_loop += 1
     print(f"[moge3-sfm] {n_loop} loop-closure edges kept")
 
-    # 4) global optimization (robust line process closes loops + rejects bad edges). mcd scaled to
-    #    the trajectory (0.15*diag): the ICP-fine radius is too small -> drifted loops get rejected.
+    # 4) global optimization (robust line process closes loops + rejects bad edges) in TWO passes.
+    #    mcd is the line-process residual scale: a single scene-scaled mcd (0.15*diag ~ 1 m) tolerates
+    #    ~1 m-thick surfaces, but a single tight mcd would prune loops whose INITIAL residual is large
+    #    under odometry drift. So run coarse first (large mcd — close loops, spread drift), then fine
+    #    (mcd ~ the pairwise registration accuracy, ~0.1 m — pull surfaces together to cm scale and
+    #    reject the edges that still can't agree).
     init_C = np.stack([np.asarray(nd.pose)[:3, 3] for nd in pg.nodes])
     diag = float(np.linalg.norm(np.percentile(init_C, 98, 0) - np.percentile(init_C, 2, 0)))
-    mcd = float(np.clip(0.15 * diag, 0.3, 3.0))
-    opt = r.GlobalOptimizationOption(max_correspondence_distance=mcd,
-                                     edge_prune_threshold=cfg.posegraph_prune_threshold,
-                                     preference_loop_closure=1.0, reference_node=0)
-    with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
-        r.global_optimization(pg, r.GlobalOptimizationLevenbergMarquardt(),
-                              r.GlobalOptimizationConvergenceCriteria(), opt)
+    coarse_mcd = float(np.clip(0.15 * diag, 0.3, 3.0))
+    fine_mcd = cfg.icp_max_corr_dist / 3.0          # ~0.1 m — the registration accuracy, NOT scene size
+    for mcd in (coarse_mcd, fine_mcd):
+        opt = r.GlobalOptimizationOption(max_correspondence_distance=mcd,
+                                         edge_prune_threshold=cfg.posegraph_prune_threshold,
+                                         preference_loop_closure=1.0, reference_node=0)
+        with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
+            r.global_optimization(pg, r.GlobalOptimizationLevenbergMarquardt(),
+                                  r.GlobalOptimizationConvergenceCriteria(), opt)
     poses_w2c = [np.linalg.inv(np.asarray(nd.pose)) for nd in pg.nodes]
 
     # 5) gravity align (rotate scene so averaged MoGe floor-normal = up -> planar room).
