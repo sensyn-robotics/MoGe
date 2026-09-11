@@ -1,14 +1,14 @@
 """Pose engine 1: match-based pairwise registration + ICP refine -> SE(3) pose graph.
 
-MoGe-3's per-frame metric point clouds are accurate, so poses come from directly REGISTERING pairs.
-The rough relative pose is recovered from the LightGlue feature MATCHES (the same ones hloc computes
-for BA) lifted to each frame's MoGe metric 3D and solved with RANSAC 3D-3D. Feature correspondences
-stay reliable at small overlap and never confuse the repetitive room surfaces (near-identical
-floor/walls) that blind FPFH-FGR matches to the WRONG wall — the failure that produced a
-mixed-direction blob. Per pair:
+Poses come from directly REGISTERING consecutive/loop pairs. The rough relative ROTATION comes from
+the DEPTH-FREE 2D essential matrix on the LightGlue matches (the same epipolar-verified matches hloc
+computes for BA): the matches are geometrically correct, so this recovers the true rotation and is
+immune to MoGe's per-keypoint depth noise — the noise that pulls a 3D-3D fit onto the wrong wall and
+produced the >30 deg mixed-direction poses. MoGe's metric depth is used only to fix the translation
+SCALE (a 1-DOF median), and point-to-plane ICP refines. Per pair:
 
-  1. LightGlue matches for the pair -> lift matched keypoints to MoGe metric 3D,
-  2. RANSAC 3D-3D (rigid) on those correspondences -> rough relative pose (rejected if too few inliers),
+  1. LightGlue matches -> 2D essential matrix (cv2 MAGSAC) -> rough rotation + translation direction,
+  2. metric scale = robust median of the MoGe 3D residual along that direction (rejected if unsupported),
   3. point-to-plane ICP on the fine clouds from that rough transform -> exact relative pose.
 
 Edges: odometry (consecutive; coast only when a pair has too few matches) + loop closure (retrieval
@@ -18,6 +18,7 @@ planar-room prior. Rigid SE(3): MoGe-3 is metric, so per-frame scale is consiste
 
 from __future__ import annotations
 
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -72,10 +73,10 @@ def _gravity_align(poses_w2c, up_cam, valid):
 
 def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3SfMConfig):
     """MoGe-3 inference + MATCH-based pairwise registration -> SE(3) pose graph + gravity align.
-    Returns (geoms, poses_w2c (N,4,4)). The rough relative pose comes from the LightGlue matches
-    (matches_h5) lifted to each frame's MoGe metric 3D (RANSAC 3D-3D), then point-to-plane ICP
-    refines it — robust to the small-overlap / repetitive-surface pairs where FPFH-FGR mismatches
-    the wrong wall. Loop candidates come from `pairs` (retrieval)."""
+    Returns (geoms, poses_w2c (N,4,4)). The rough relative rotation comes from the depth-free 2D
+    essential matrix on the LightGlue matches (matches_h5), MoGe depth fixes only the scale, then
+    point-to-plane ICP refines — immune to the MoGe depth noise that pulled 3D-3D fits onto the wrong
+    wall. Loop candidates come from `pairs` (retrieval)."""
     import torch
     import open3d as o3d
     from moge.model import import_model_class_by_version
@@ -113,22 +114,41 @@ def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3
     from hloc.utils.io import get_matches
 
     def _rough_from_matches(a, b):
-        """Rough a->b pose from the LightGlue matches lifted to each frame's MoGe metric 3D
-        (RANSAC 3D-3D). Feature correspondences stay reliable at small overlap and don't confuse
-        the repetitive room surfaces that FPFH-FGR matches to the wrong wall. (T_a2b or None, n_inl)."""
+        """Rough a->b pose from the LightGlue matches. ROTATION (+ translation direction) comes from
+        the DEPTH-FREE 2D essential matrix (cv2 MAGSAC) on the matched pixels — the matches are
+        epipolar-verified, so this recovers the geometrically-correct rotation and is immune to MoGe's
+        per-keypoint depth noise, which pulls a 3D-3D fit onto the wrong wall (the >30 deg failure).
+        The metric SCALE is a 1-DOF robust median of the MoGe 3D residual along that direction; ICP
+        then refines. Returns (T_a2b or None, n_essential_inliers)."""
         m, _ = get_matches(matches_h5, geoms[a].name, geoms[b].name)   # (M,2) kpt indices [a, b]
         if m.shape[0] < cfg.min_pair_inliers:
             return None, int(m.shape[0])
-        v = geoms[a].kp_valid[m[:, 0]] & geoms[b].kp_valid[m[:, 1]]
-        pa = geoms[a].kp3d[m[v, 0]].astype(np.float64)
-        pb = geoms[b].kp3d[m[v, 1]].astype(np.float64)
-        if len(pa) < cfg.min_pair_inliers:
-            return None, int(len(pa))
-        T, inl = u3d.np.solve_pose_ransac(pa, pb, mode="rigid",   # transform p(a)->q(b) = a->b
-                                          threshold=cfg.ransac_threshold, rng=rng)
-        if int(inl.sum()) < cfg.min_pair_inliers:
-            return None, int(inl.sum())
-        return np.asarray(T, dtype=np.float64), int(inl.sum())
+        ua = kpts[a][m[:, 0]].astype(np.float64)      # matched pixels in a
+        ub = kpts[b][m[:, 1]].astype(np.float64)      # matched pixels in b
+        # normalize to calibrated bearings with each frame's own MoGe intrinsics, then one calibrated
+        # essential-matrix RANSAC (cameraMatrix = I, threshold in normalized units).
+        na = cv2.undistortPoints(ua.reshape(-1, 1, 2), geoms[a].K, None).reshape(-1, 2)
+        nb = cv2.undistortPoints(ub.reshape(-1, 1, 2), geoms[b].K, None).reshape(-1, 2)
+        E, em = cv2.findEssentialMat(na, nb, cameraMatrix=np.eye(3), method=cv2.USAC_MAGSAC,
+                                     prob=0.999, threshold=cfg.epipolar_thresh)
+        if E is None or em is None or E.shape != (3, 3):
+            return None, 0
+        em = em.ravel().astype(bool)
+        n_in = int(em.sum())
+        if n_in < cfg.min_pair_inliers or n_in < cfg.min_pair_inlier_ratio * len(em):
+            return None, n_in
+        _, R_ba, t_dir, _ = cv2.recoverPose(E, na[em], nb[em], np.eye(3))  # normalized pts -> I
+        t_dir = t_dir.ravel()
+        # metric scale from essential inliers with valid MoGe depth on both frames:
+        # pb ≈ R_ba @ pa + s * t_dir  ->  s = median((pb - R_ba @ pa) · t_dir).
+        vd = em & geoms[a].kp_valid[m[:, 0]] & geoms[b].kp_valid[m[:, 1]]
+        if int(vd.sum()) < cfg.min_pair_inliers:
+            return None, n_in
+        pa3 = geoms[a].kp3d[m[vd, 0]].astype(np.float64)
+        pb3 = geoms[b].kp3d[m[vd, 1]].astype(np.float64)
+        s = float(np.median((pb3 - (R_ba @ pa3.T).T) @ t_dir))
+        T = np.eye(4); T[:3, :3] = R_ba; T[:3, 3] = s * t_dir
+        return T, n_in
 
     def register(a, b):
         """Match-based rough pose (a->b) then point-to-plane ICP refine on the fine clouds.
@@ -147,10 +167,10 @@ def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3
         return T, info, reg.fitness, reg.inlier_rmse, n_inl
 
     # 2) odometry edges (consecutive). source=i-1, target=i so T = cam_i <- cam_{i-1} matches
-    #    PoseGraphEdge(i-1, i, T). The match-based rough pose is reliable, so trust it; only when a
-    #    consecutive pair has too few feature matches (fast motion / genuine no-overlap) COAST the init
-    #    with the last accepted relative motion and add the edge down-weighted, letting loop closure
-    #    recover it — never a wrong-but-confident FPFH pose.
+    #    PoseGraphEdge(i-1, i, T). Accept the edge only when the pair is well-supported AND the ICP
+    #    clouds overlap; when a pair has too few/low-fraction matches or the fit doesn't overlap (fast
+    #    motion, no overlap, or a wrong rough rotation that slipped through) COAST the init with the
+    #    last accepted relative motion and add the edge down-weighted, letting loop closure recover it.
     pg = r.PoseGraph()
     pg.nodes.append(r.PoseGraphNode(np.eye(4)))
     w2c = np.eye(4)
@@ -158,7 +178,12 @@ def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3
     n_bad_odo = 0
     for i in range(1, n):
         T, info, fit, rmse, n_inl = register(i - 1, i)
-        good = T is not None
+        # Trust the edge only when the rough pose survived (enough well-supported inliers) AND the
+        # ICP-refined clouds actually OVERLAP (fitness) with plausible inter-frame motion. A wrong
+        # rough rotation that slipped through leaves the fine clouds non-overlapping -> low fitness
+        # -> coast the last accepted motion instead of welding a frame on at the wrong angle.
+        good = (T is not None and fit >= cfg.icp_min_fitness
+                and float(np.linalg.norm(np.asarray(T)[:3, 3])) <= cfg.icp_max_motion)
         if good:
             prev_T = T
         else:
@@ -166,7 +191,7 @@ def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3
         w2c = T @ w2c
         pg.nodes.append(r.PoseGraphNode(np.linalg.inv(w2c)))
         pg.edges.append(r.PoseGraphEdge(i - 1, i, T, info, uncertain=not good))
-    print(f"[moge3-sfm] {n - 1} odometry edges ({n_bad_odo} coasted — too few matches)")
+    print(f"[moge3-sfm] {n - 1} odometry edges ({n_bad_odo} coasted — low support/overlap)")
 
     # 3) loop-closure edges from retrieval pairs, kept only when the registration is confident.
     n_loop = 0
@@ -175,7 +200,8 @@ def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3
         if abs(ia - ib) <= cfg.sequential_window:
             continue
         T, info, fit, rmse, n_inl = register(ia, ib)
-        if T is None or rmse > cfg.icp_loop_max_rmse:   # confident = enough match inliers + ICP agrees
+        # confident loop = well-supported rough pose + ICP clouds overlap (fitness) + tight residual
+        if T is None or fit < cfg.icp_loop_min_fitness or rmse > cfg.icp_loop_max_rmse:
             continue
         pg.edges.append(r.PoseGraphEdge(ia, ib, T, info, uncertain=True))
         n_loop += 1

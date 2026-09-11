@@ -55,8 +55,13 @@ class MoGe3SfMConfig:
     # avoids a utils3d_moge bug in solve_pose(mode='similar') — s*R fails to broadcast
     # ((B,S) vs (B,S,3,3)) on the batched RANSAC path.
     pose_mode: str = "rigid"           # 'rigid' | 'similar' (latter is currently broken upstream)
-    ransac_threshold: float = 0.05     # metres, solve_pose_ransac inlier threshold
-    min_pair_inliers: int = 20         # drop a pair edge below this many 3D inliers
+    ransac_threshold: float = 0.05     # metres, solve_pose_ransac inlier threshold (pose_graph engine)
+    # icp-engine rough registration derives ROTATION from the depth-free 2D essential matrix (immune
+    # to MoGe per-keypoint depth noise that pulls a 3D-3D fit onto the wrong wall -> >30 deg poses);
+    # MoGe depth supplies only the metric scale. Threshold is in CALIBRATED (normalized) coords.
+    epipolar_thresh: float = 0.002     # ~2 px at f~=1000; essential-matrix RANSAC inlier gate
+    min_pair_inliers: int = 20         # drop a pair edge below this many essential inliers
+    min_pair_inlier_ratio: float = 0.5 # AND drop it below this inlier FRACTION of the matches
     gnc_iters: int = 20
     pose_graph_niter: int = 10
 
