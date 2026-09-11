@@ -1,19 +1,20 @@
-"""Pose engine 1: pairwise global registration (FGR) + ICP refine -> SE(3) pose graph.
+"""Pose engine 1: match-based pairwise registration + ICP refine -> SE(3) pose graph.
 
-MoGe-3's per-frame metric point clouds are accurate, so the right way to recover poses is to
-directly REGISTER the clouds — but robustly, with a real global step (no pose prior), not just
-local ICP (which drifts) or sparse-match 3D-3D (which collapses at small baselines). Per pair:
+MoGe-3's per-frame metric point clouds are accurate, so poses come from directly REGISTERING pairs.
+The rough relative pose is recovered from the LightGlue feature MATCHES (the same ones hloc computes
+for BA) lifted to each frame's MoGe metric 3D and solved with RANSAC 3D-3D. Feature correspondences
+stay reliable at small overlap and never confuse the repetitive room surfaces (near-identical
+floor/walls) that blind FPFH-FGR matches to the WRONG wall — the failure that produced a
+mixed-direction blob. Per pair:
 
-  1. subsample each cloud (coarse voxel ~1-2k pts) + FPFH features,
-  2. Fast Global Registration (Open3D FGR) on those -> a rough transform with NO init, robust to
-     large viewpoint change (validated: 63deg+3m recovered to 0.3deg/0.07m),
-  3. point-to-plane ICP on the finer clouds from that rough transform -> exact relative pose.
+  1. LightGlue matches for the pair -> lift matched keypoints to MoGe metric 3D,
+  2. RANSAC 3D-3D (rigid) on those correspondences -> rough relative pose (rejected if too few inliers),
+  3. point-to-plane ICP on the fine clouds from that rough transform -> exact relative pose.
 
-Edges: odometry (consecutive) + loop closure (retrieval pairs, kept only when the registration is
-confident). Open3D global_optimization (robust line process) closes loops + rejects bad edges, then
-gravity-align (rotate so the averaged MoGe floor-normal points up) enforces the planar-room prior.
-Rigid SE(3): MoGe-3 is metric, so per-frame scale is consistent and no scale DOF is needed (a Sim3
-graph instead collapses cameras to a point on small-baseline video)."""
+Edges: odometry (consecutive; coast only when a pair has too few matches) + loop closure (retrieval
+pairs, kept when confident). Open3D global_optimization (robust line process) closes loops + rejects
+bad edges, then gravity-align (rotate so the averaged MoGe floor-normal points up) enforces the
+planar-room prior. Rigid SE(3): MoGe-3 is metric, so per-frame scale is consistent (no scale DOF)."""
 
 from __future__ import annotations
 
@@ -33,12 +34,6 @@ def _to_pcd(points, mask, voxel):
     return pcd
 
 
-def _fpfh(pcd, voxel):
-    import open3d as o3d
-    return o3d.pipelines.registration.compute_fpfh_feature(
-        pcd, o3d.geometry.KDTreeSearchParamHybrid(radius=voxel * 5, max_nn=100))
-
-
 def _up_from_normals(normal, mask):
     """Per-frame 'up' (opposite gravity) in the CAMERA frame from MoGe normals.
 
@@ -52,36 +47,6 @@ def _up_from_normals(normal, mask):
     _, V = np.linalg.eigh(n.T @ n)
     v = V[:, -1]
     return v if v[1] < 0 else -v
-
-
-def _register_pair(cs, fs, ct, ft, fine_s, fine_t, cfg):
-    """Global-register + ICP-refine source onto target. Returns (T source->target, info,
-    fitness, rmse). FGR needs no initial pose, so this works for wide-baseline loop pairs too."""
-    import open3d as o3d
-    r = o3d.pipelines.registration
-    fine_dist = cfg.icp_max_corr_dist / 2.0
-    # FGR's internal RANSAC crashes on empty/near-empty clouds or zero feature matches
-    # ("low must be < high, got 0 and 0"). Guard + fall back to identity init: consecutive frames
-    # still align by ICP, and a loop pair that can't be globally registered just fails the gate.
-    Tinit = np.eye(4)
-    if len(cs.points) >= 20 and len(ct.points) >= 20:
-        try:
-            fgr = r.registration_fgr_based_on_feature_matching(
-                cs, ct, fs, ft,
-                r.FastGlobalRegistrationOption(maximum_correspondence_distance=cfg.coarse_voxel * 1.5))
-            Tf = np.asarray(fgr.transformation)
-            if Tf.shape == (4, 4) and np.isfinite(Tf).all():
-                Tinit = Tf
-        except Exception:
-            pass
-    if len(fine_s.points) < 10 or len(fine_t.points) < 10:
-        return Tinit, np.eye(6), 0.0, 1e9
-    reg = r.registration_icp(fine_s, fine_t, fine_dist, Tinit,
-                             r.TransformationEstimationPointToPlane(),
-                             r.ICPConvergenceCriteria(max_iteration=cfg.icp_max_iter))
-    T = np.asarray(reg.transformation)
-    info = r.get_information_matrix_from_point_clouds(fine_s, fine_t, fine_dist, T)
-    return T, info, reg.fitness, reg.inlier_rmse
 
 
 def _gravity_align(poses_w2c, up_cam, valid):
@@ -106,9 +71,11 @@ def _gravity_align(poses_w2c, up_cam, valid):
 
 
 def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3SfMConfig):
-    """MoGe-3 inference + FGR/ICP pairwise registration -> SE(3) pose graph + gravity align.
-    Returns (geoms, poses_w2c (N,4,4)). `matches_h5` is unused for poses (kept for the BA
-    caller); loop candidates come from `pairs` (retrieval), registered by cloud geometry."""
+    """MoGe-3 inference + MATCH-based pairwise registration -> SE(3) pose graph + gravity align.
+    Returns (geoms, poses_w2c (N,4,4)). The rough relative pose comes from the LightGlue matches
+    (matches_h5) lifted to each frame's MoGe metric 3D (RANSAC 3D-3D), then point-to-plane ICP
+    refines it — robust to the small-overlap / repetitive-surface pairs where FPFH-FGR mismatches
+    the wrong wall. Loop candidates come from `pairs` (retrieval)."""
     import torch
     import open3d as o3d
     from moge.model import import_model_class_by_version
@@ -121,9 +88,9 @@ def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3
     rng = np.random.default_rng(0)
     n = len(image_paths)
 
-    # 1) per-frame: MoGe inference -> geom + fine cloud (ICP) + coarse cloud & FPFH (FGR) + up.
+    # 1) per-frame: MoGe inference -> geom (keypoint 3D for the match-based pose) + fine cloud (ICP) + up.
     geoms: list[_FrameGeom] = []
-    fine, coarse, fpfh, up_cam = [], [], [], []
+    fine, up_cam = [], []
     for i, q in enumerate(image_paths):
         rgb = np.array(Image.open(q).convert("RGB"))
         t = torch.tensor(rgb / 255.0, dtype=torch.float32, device=device).permute(2, 0, 1)
@@ -137,41 +104,69 @@ def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3
         kp3d, kp_valid, kp_rgb, fuse_xyz, fuse_rgb = _lift_frame(points, mask, rgb, kpts[i], cfg, rng)
         geoms.append(_FrameGeom(q.name, (rgb.shape[1], rgb.shape[0]), K,
                                 kp3d, kp_valid, kp_rgb, fuse_xyz, fuse_rgb))
-        cf = _to_pcd(points, mask, cfg.coarse_voxel)
         fine.append(_to_pcd(points, mask, cfg.icp_voxel))
-        coarse.append(cf)
-        fpfh.append(_fpfh(cf, cfg.coarse_voxel))
         up_cam.append(_up_from_normals(pred["normal"].cpu().numpy(), mask)
                       if "normal" in pred else None)
         if (i + 1) % 50 == 0:
             print(f"[moge3-sfm] MoGe inference + cloud {i + 1}/{n}")
 
-    def register(a, b):
-        return _register_pair(coarse[a], fpfh[a], coarse[b], fpfh[b], fine[a], fine[b], cfg)
+    from hloc.utils.io import get_matches
 
-    # 2) odometry edges (consecutive), accumulate node init. source=i-1, target=i so
-    #    T = cam_i <- cam_{i-1} matches PoseGraphEdge(i-1, i, T). GATE each consecutive
-    #    registration: a blurry / low-overlap / textureless frame yields a bad ICP that, trusted as
-    #    a confident edge, offsets the whole downstream node-init chain (and inflates drift so real
-    #    loops look like outliers). On failure, COAST the init through it (reuse the last accepted
-    #    relative motion — constant velocity) and add the edge as uncertain + heavily down-weighted,
-    #    letting loop closure + global optimization recover the pose instead of the bad edge.
+    def _rough_from_matches(a, b):
+        """Rough a->b pose from the LightGlue matches lifted to each frame's MoGe metric 3D
+        (RANSAC 3D-3D). Feature correspondences stay reliable at small overlap and don't confuse
+        the repetitive room surfaces that FPFH-FGR matches to the wrong wall. (T_a2b or None, n_inl)."""
+        m, _ = get_matches(matches_h5, geoms[a].name, geoms[b].name)   # (M,2) kpt indices [a, b]
+        if m.shape[0] < cfg.min_pair_inliers:
+            return None, int(m.shape[0])
+        v = geoms[a].kp_valid[m[:, 0]] & geoms[b].kp_valid[m[:, 1]]
+        pa = geoms[a].kp3d[m[v, 0]].astype(np.float64)
+        pb = geoms[b].kp3d[m[v, 1]].astype(np.float64)
+        if len(pa) < cfg.min_pair_inliers:
+            return None, int(len(pa))
+        T, inl = u3d.np.solve_pose_ransac(pa, pb, mode="rigid",   # transform p(a)->q(b) = a->b
+                                          threshold=cfg.ransac_threshold, rng=rng)
+        if int(inl.sum()) < cfg.min_pair_inliers:
+            return None, int(inl.sum())
+        return np.asarray(T, dtype=np.float64), int(inl.sum())
+
+    def register(a, b):
+        """Match-based rough pose (a->b) then point-to-plane ICP refine on the fine clouds.
+        Returns (T, info, fitness, rmse, n_match_inliers); T is None if the rough step fails."""
+        Tinit, n_inl = _rough_from_matches(a, b)
+        if Tinit is None:
+            return None, np.eye(6), 0.0, 1e9, n_inl
+        fine_dist = cfg.icp_max_corr_dist / 2.0
+        if len(fine[a].points) < 10 or len(fine[b].points) < 10:
+            return Tinit, np.eye(6), 1.0, 0.0, n_inl        # trust the match pose; too few pts to ICP
+        reg = r.registration_icp(fine[a], fine[b], fine_dist, Tinit,
+                                 r.TransformationEstimationPointToPlane(),
+                                 r.ICPConvergenceCriteria(max_iteration=cfg.icp_max_iter))
+        T = np.asarray(reg.transformation)
+        info = r.get_information_matrix_from_point_clouds(fine[a], fine[b], fine_dist, T)
+        return T, info, reg.fitness, reg.inlier_rmse, n_inl
+
+    # 2) odometry edges (consecutive). source=i-1, target=i so T = cam_i <- cam_{i-1} matches
+    #    PoseGraphEdge(i-1, i, T). The match-based rough pose is reliable, so trust it; only when a
+    #    consecutive pair has too few feature matches (fast motion / genuine no-overlap) COAST the init
+    #    with the last accepted relative motion and add the edge down-weighted, letting loop closure
+    #    recover it — never a wrong-but-confident FPFH pose.
     pg = r.PoseGraph()
     pg.nodes.append(r.PoseGraphNode(np.eye(4)))
     w2c = np.eye(4)
     prev_T = np.eye(4)          # last accepted relative motion (constant-velocity coast)
     n_bad_odo = 0
     for i in range(1, n):
-        T, info, fit, _ = register(i - 1, i)
-        good = fit >= cfg.icp_min_fitness and float(np.linalg.norm(T[:3, 3])) <= cfg.icp_max_motion
+        T, info, fit, rmse, n_inl = register(i - 1, i)
+        good = T is not None
         if good:
             prev_T = T
         else:
-            T, info, n_bad_odo = prev_T, info * 1e-2, n_bad_odo + 1
+            T, info, n_bad_odo = prev_T, np.eye(6) * 1e-2, n_bad_odo + 1
         w2c = T @ w2c
         pg.nodes.append(r.PoseGraphNode(np.linalg.inv(w2c)))
         pg.edges.append(r.PoseGraphEdge(i - 1, i, T, info, uncertain=not good))
-    print(f"[moge3-sfm] {n - 1} odometry edges ({n_bad_odo} coasted/down-weighted)")
+    print(f"[moge3-sfm] {n - 1} odometry edges ({n_bad_odo} coasted — too few matches)")
 
     # 3) loop-closure edges from retrieval pairs, kept only when the registration is confident.
     n_loop = 0
@@ -179,30 +174,24 @@ def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3
         ia, ib = name_to_idx[a], name_to_idx[b]
         if abs(ia - ib) <= cfg.sequential_window:
             continue
-        T, info, fit, rmse = register(ia, ib)
-        if fit < cfg.icp_loop_min_fitness or rmse > cfg.icp_loop_max_rmse:
+        T, info, fit, rmse, n_inl = register(ia, ib)
+        if T is None or rmse > cfg.icp_loop_max_rmse:   # confident = enough match inliers + ICP agrees
             continue
         pg.edges.append(r.PoseGraphEdge(ia, ib, T, info, uncertain=True))
         n_loop += 1
     print(f"[moge3-sfm] {n_loop} loop-closure edges kept")
 
-    # 4) global optimization (robust line process closes loops + rejects bad edges) in TWO passes.
-    #    mcd is the line-process residual scale: a single scene-scaled mcd (0.15*diag ~ 1 m) tolerates
-    #    ~1 m-thick surfaces, but a single tight mcd would prune loops whose INITIAL residual is large
-    #    under odometry drift. So run coarse first (large mcd — close loops, spread drift), then fine
-    #    (mcd ~ the pairwise registration accuracy, ~0.1 m — pull surfaces together to cm scale and
-    #    reject the edges that still can't agree).
-    init_C = np.stack([np.asarray(nd.pose)[:3, 3] for nd in pg.nodes])
-    diag = float(np.linalg.norm(np.percentile(init_C, 98, 0) - np.percentile(init_C, 2, 0)))
-    coarse_mcd = float(np.clip(0.15 * diag, 0.3, 3.0))
-    fine_mcd = cfg.icp_max_corr_dist / 3.0          # ~0.1 m — the registration accuracy, NOT scene size
-    for mcd in (coarse_mcd, fine_mcd):
-        opt = r.GlobalOptimizationOption(max_correspondence_distance=mcd,
-                                         edge_prune_threshold=cfg.posegraph_prune_threshold,
-                                         preference_loop_closure=1.0, reference_node=0)
-        with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
-            r.global_optimization(pg, r.GlobalOptimizationLevenbergMarquardt(),
-                                  r.GlobalOptimizationConvergenceCriteria(), opt)
+    # 4) global optimization (robust line process closes loops + rejects the few bad edges). With the
+    #    reliable match-based init the odometry drift is small, so a single MODERATE mcd both closes
+    #    loops and pulls surfaces to cm scale — no scene-scaled looseness (which left the FGR run ~1 m
+    #    thick) and no two-stage tightening (which pruned real loops).
+    mcd = float(max(3.0 * cfg.icp_voxel, 0.20))
+    opt = r.GlobalOptimizationOption(max_correspondence_distance=mcd,
+                                     edge_prune_threshold=cfg.posegraph_prune_threshold,
+                                     preference_loop_closure=1.0, reference_node=0)
+    with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
+        r.global_optimization(pg, r.GlobalOptimizationLevenbergMarquardt(),
+                              r.GlobalOptimizationConvergenceCriteria(), opt)
     poses_w2c = [np.linalg.inv(np.asarray(nd.pose)) for nd in pg.nodes]
 
     # 5) gravity align (rotate scene so averaged MoGe floor-normal = up -> planar room).
