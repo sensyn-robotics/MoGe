@@ -34,9 +34,17 @@ class MoGe3SfMConfig:
     #        baselines (cameras collapse); kept for non-sequential captures.
     pose_engine: str = "icp"
     icp_voxel: float = 0.03            # metres — voxel-downsample each cloud for the fine ICP refine
-    coarse_voxel: float = 0.15         # metres — coarse downsample (~1-2k pts) for FPFH + FGR global reg
+    coarse_voxel: float = 0.15         # metres — coarse downsample (~1-2k pts) for FPFH + RANSAC global reg
     icp_max_corr_dist: float = 0.30    # metres — ICP correspondence radius (coarse pass; fine = /6)
     icp_max_iter: int = 60
+    # icp-engine rough registration = Open3D RANSAC feature matching (FPFH), the global-registration
+    # tutorial's primary method, on the coarse clouds -> point-to-plane ICP refine. RANSAC's edge-length
+    # + distance correspondence checkers reject the geometrically-inconsistent matches that blind FGR
+    # accepted on repetitive room surfaces (the wrong-wall failure); confidence gates then reject the
+    # pairs that still can't register.
+    ransac_max_iter: int = 100000      # Open3D RANSACConvergenceCriteria max_iteration
+    ransac_confidence: float = 0.999   # ... and confidence (early stop)
+    ransac_min_loop_fitness: float = 0.10  # reject a LOOP pair whose RANSAC rough fitness is below this
     icp_min_fitness: float = 0.30      # odometry edge below this overlap fitness -> low-weight + coast
     icp_max_motion: float = 1.00       # metres — odometry translation above this -> coast + down-weight
     scale_normalize: bool = True       # pin each MoGe cloud to a common scale (median depth) — MoGe's
@@ -56,12 +64,7 @@ class MoGe3SfMConfig:
     # ((B,S) vs (B,S,3,3)) on the batched RANSAC path.
     pose_mode: str = "rigid"           # 'rigid' | 'similar' (latter is currently broken upstream)
     ransac_threshold: float = 0.05     # metres, solve_pose_ransac inlier threshold (pose_graph engine)
-    # icp-engine rough registration derives ROTATION from the depth-free 2D essential matrix (immune
-    # to MoGe per-keypoint depth noise that pulls a 3D-3D fit onto the wrong wall -> >30 deg poses);
-    # MoGe depth supplies only the metric scale. Threshold is in CALIBRATED (normalized) coords.
-    epipolar_thresh: float = 0.002     # ~2 px at f~=1000; essential-matrix RANSAC inlier gate
-    min_pair_inliers: int = 20         # drop a pair edge below this many essential inliers
-    min_pair_inlier_ratio: float = 0.5 # AND drop it below this inlier FRACTION of the matches
+    min_pair_inliers: int = 20         # pose_graph engine: drop a pair edge below this many 3D inliers
     gnc_iters: int = 20
     pose_graph_niter: int = 10
 
