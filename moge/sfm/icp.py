@@ -1,22 +1,23 @@
-"""Pose engine 1: Open3D RANSAC feature-based global registration + ICP refine -> SE(3) pose graph.
+"""Pose engine 1: match-based 3D-3D rough registration + ICP refine -> SE(3) pose graph.
 
-MoGe-3's per-frame metric point clouds are accurate, so poses come from directly REGISTERING the
-clouds. The rough relative pose is the Open3D global-registration tutorial's PRIMARY method:
-FPFH features + RANSAC feature matching (registration_ransac_based_on_feature_matching). Unlike Fast
-Global Registration (FGR), RANSAC applies edge-length + distance correspondence checkers that reject
-the geometrically-inconsistent matches FGR accepted on the repetitive room surfaces (near-identical
-floor/walls) — the wrong-wall matching that produced a mixed-direction blob. Per pair:
+MoGe-3's per-frame metric point clouds are accurate, so poses come from directly REGISTERING pairs.
+The rough relative pose is recovered from the LightGlue feature MATCHES (the same ones hloc computes
+for BA) lifted to each frame's MoGe metric 3D and solved with RANSAC 3D-3D. Feature correspondences
+stay reliable at the SMALL inter-frame baselines of this handheld capture (where FPFH global
+registration under-performs and the 2D essential matrix is degenerate) and use the metric depth
+directly, which gave the most planar reconstruction of any rough method tried. Per pair:
 
-  1. subsample each cloud (coarse voxel ~1-2k pts) + FPFH features,
-  2. RANSAC feature matching (with checkers, no pose prior) -> a rough transform,
-  3. point-to-plane ICP on the finer clouds from that rough transform -> exact relative pose.
+  1. LightGlue matches for the pair -> lift matched keypoints to MoGe metric 3D,
+  2. RANSAC 3D-3D (rigid) on those correspondences -> rough relative pose (rejected if too few inliers),
+  3. point-to-plane ICP on the fine clouds from that rough transform -> exact relative pose.
 
-REJECT WRONG PAIRS: an odometry edge is coasted when its ICP overlap (fitness) or motion is
-implausible; a loop edge is kept only when BOTH the RANSAC rough registration is confident
-(fitness >= ransac_min_loop_fitness) AND the ICP agrees (fitness/rmse). Open3D global_optimization
-(robust line process) then closes loops + rejects the residual bad edges, and gravity-align rotates
-the scene so the averaged MoGe floor-normal points up (planar-room prior). Rigid SE(3): MoGe-3 is
-metric, so per-frame scale is consistent and no scale DOF is needed."""
+REJECT WRONG PAIRS: the rough 3D-3D pose is mostly right but a minority of pairs lock onto the wrong
+repetitive surface (>30 deg off). Such a pose does not align the DENSE clouds, so it fails the ICP
+overlap gate: an odometry edge is coasted when its ICP fitness or motion is implausible, and a loop
+edge is kept only when the ICP agrees (fitness + rmse). Open3D global_optimization (robust line
+process) then closes loops + rejects the residual bad edges, and gravity-align rotates the scene so
+the averaged MoGe floor-normal points up. Rigid SE(3): MoGe-3 is metric, so per-frame scale is
+consistent and no scale DOF is needed."""
 
 from __future__ import annotations
 
@@ -36,12 +37,6 @@ def _to_pcd(points, mask, voxel):
     return pcd
 
 
-def _fpfh(pcd, voxel):
-    import open3d as o3d
-    return o3d.pipelines.registration.compute_fpfh_feature(
-        pcd, o3d.geometry.KDTreeSearchParamHybrid(radius=voxel * 5, max_nn=100))
-
-
 def _up_from_normals(normal, mask):
     """Per-frame 'up' (opposite gravity) in the CAMERA frame from MoGe normals.
 
@@ -55,40 +50,6 @@ def _up_from_normals(normal, mask):
     _, V = np.linalg.eigh(n.T @ n)
     v = V[:, -1]
     return v if v[1] < 0 else -v
-
-
-def _register_pair(cs, fs, ct, ft, fine_s, fine_t, cfg):
-    """Open3D RANSAC feature-based global registration + ICP refine, source->target.
-    Returns (T, info, fitness, rmse, rough_fit): `fitness`/`rmse` are the ICP overlap, `rough_fit`
-    is the RANSAC feature-matching fitness (used to reject unconfident loop pairs). RANSAC needs no
-    pose prior, so it also handles wide-baseline loop pairs; consecutive frames that RANSAC can't
-    register still align by ICP from identity (small motion)."""
-    import open3d as o3d
-    r = o3d.pipelines.registration
-    dist = cfg.coarse_voxel * 1.5
-    fine_dist = cfg.icp_max_corr_dist / 2.0
-    Tinit, rough_fit = np.eye(4), 0.0
-    if len(cs.points) >= 20 and len(ct.points) >= 20:
-        try:
-            res = r.registration_ransac_based_on_feature_matching(
-                cs, ct, fs, ft, True, dist,
-                r.TransformationEstimationPointToPoint(False), 3,
-                [r.CorrespondenceCheckerBasedOnEdgeLength(0.9),
-                 r.CorrespondenceCheckerBasedOnDistance(dist)],
-                r.RANSACConvergenceCriteria(cfg.ransac_max_iter, cfg.ransac_confidence))
-            Tf = np.asarray(res.transformation)
-            if Tf.shape == (4, 4) and np.isfinite(Tf).all():
-                Tinit, rough_fit = Tf, float(res.fitness)
-        except Exception:
-            pass
-    if len(fine_s.points) < 10 or len(fine_t.points) < 10:
-        return Tinit, np.eye(6), 0.0, 1e9, rough_fit
-    reg = r.registration_icp(fine_s, fine_t, fine_dist, Tinit,
-                             r.TransformationEstimationPointToPlane(),
-                             r.ICPConvergenceCriteria(max_iteration=cfg.icp_max_iter))
-    T = np.asarray(reg.transformation)
-    info = r.get_information_matrix_from_point_clouds(fine_s, fine_t, fine_dist, T)
-    return T, info, reg.fitness, reg.inlier_rmse, rough_fit
 
 
 def _gravity_align(poses_w2c, up_cam, valid):
@@ -113,9 +74,11 @@ def _gravity_align(poses_w2c, up_cam, valid):
 
 
 def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3SfMConfig):
-    """MoGe-3 inference + RANSAC/ICP pairwise registration -> SE(3) pose graph + gravity align.
-    Returns (geoms, poses_w2c (N,4,4)). `matches_h5` is unused for poses (kept for the BA caller);
-    loop candidates come from `pairs` (retrieval), registered by cloud geometry."""
+    """MoGe-3 inference + MATCH-based 3D-3D pairwise registration -> SE(3) pose graph + gravity align.
+    Returns (geoms, poses_w2c (N,4,4)). The rough relative pose comes from the LightGlue matches
+    (matches_h5) lifted to each frame's MoGe metric 3D (RANSAC 3D-3D), then point-to-plane ICP
+    refines it; the ICP-overlap gates reject the minority of pairs that locked onto the wrong surface.
+    Loop candidates come from `pairs` (retrieval)."""
     import torch
     import open3d as o3d
     from moge.model import import_model_class_by_version
@@ -128,9 +91,9 @@ def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3
     rng = np.random.default_rng(0)
     n = len(image_paths)
 
-    # 1) per-frame: MoGe inference -> geom + fine cloud (ICP) + coarse cloud & FPFH (RANSAC) + up.
+    # 1) per-frame: MoGe inference -> geom (keypoint 3D for the match-based pose) + fine cloud (ICP) + up.
     geoms: list[_FrameGeom] = []
-    fine, coarse, fpfh, up_cam = [], [], [], []
+    fine, up_cam = [], []
     for i, q in enumerate(image_paths):
         rgb = np.array(Image.open(q).convert("RGB"))
         t = torch.tensor(rgb / 255.0, dtype=torch.float32, device=device).permute(2, 0, 1)
@@ -144,60 +107,89 @@ def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3
         kp3d, kp_valid, kp_rgb, fuse_xyz, fuse_rgb = _lift_frame(points, mask, rgb, kpts[i], cfg, rng)
         geoms.append(_FrameGeom(q.name, (rgb.shape[1], rgb.shape[0]), K,
                                 kp3d, kp_valid, kp_rgb, fuse_xyz, fuse_rgb))
-        cf = _to_pcd(points, mask, cfg.coarse_voxel)
         fine.append(_to_pcd(points, mask, cfg.icp_voxel))
-        coarse.append(cf)
-        fpfh.append(_fpfh(cf, cfg.coarse_voxel))
         up_cam.append(_up_from_normals(pred["normal"].cpu().numpy(), mask)
                       if "normal" in pred else None)
         if (i + 1) % 50 == 0:
             print(f"[moge3-sfm] MoGe inference + cloud {i + 1}/{n}")
 
-    def register(a, b):
-        return _register_pair(coarse[a], fpfh[a], coarse[b], fpfh[b], fine[a], fine[b], cfg)
+    from hloc.utils.io import get_matches
 
-    # 2) odometry edges (consecutive), accumulate node init. source=i-1, target=i so
-    #    T = cam_i <- cam_{i-1} matches PoseGraphEdge(i-1, i, T). REJECT a wrong edge: a blurry /
-    #    low-overlap / wrong-wall registration yields a bad ICP that, trusted, offsets the whole
-    #    downstream node-init chain. On failure (ICP overlap below icp_min_fitness or motion above
-    #    icp_max_motion), COAST the init through it (reuse the last accepted relative motion) and add
-    #    the edge uncertain + heavily down-weighted, letting loop closure recover the pose.
+    def _rough_from_matches(a, b):
+        """Rough a->b pose from the LightGlue matches lifted to each frame's MoGe metric 3D
+        (RANSAC 3D-3D). Reliable at small overlap and at small baselines. (T_a2b or None, n_inl)."""
+        m, _ = get_matches(matches_h5, geoms[a].name, geoms[b].name)   # (M,2) kpt indices [a, b]
+        if m.shape[0] < cfg.min_pair_inliers:
+            return None, int(m.shape[0])
+        v = geoms[a].kp_valid[m[:, 0]] & geoms[b].kp_valid[m[:, 1]]
+        pa = geoms[a].kp3d[m[v, 0]].astype(np.float64)
+        pb = geoms[b].kp3d[m[v, 1]].astype(np.float64)
+        if len(pa) < cfg.min_pair_inliers:
+            return None, int(len(pa))
+        T, inl = u3d.np.solve_pose_ransac(pa, pb, mode="rigid",   # transform p(a)->q(b) = a->b
+                                          threshold=cfg.ransac_threshold, rng=rng)
+        if int(inl.sum()) < cfg.min_pair_inliers:
+            return None, int(inl.sum())
+        return np.asarray(T, dtype=np.float64), int(inl.sum())
+
+    def register(a, b):
+        """Match-based rough pose (a->b) then point-to-plane ICP refine on the fine clouds.
+        Returns (T, info, fitness, rmse); T is None if the rough step fails."""
+        Tinit, _ = _rough_from_matches(a, b)
+        if Tinit is None:
+            return None, np.eye(6), 0.0, 1e9
+        fine_dist = cfg.icp_max_corr_dist / 2.0
+        if len(fine[a].points) < 10 or len(fine[b].points) < 10:
+            return Tinit, np.eye(6), 1.0, 0.0        # trust the match pose; too few pts to ICP
+        reg = r.registration_icp(fine[a], fine[b], fine_dist, Tinit,
+                                 r.TransformationEstimationPointToPlane(),
+                                 r.ICPConvergenceCriteria(max_iteration=cfg.icp_max_iter))
+        T = np.asarray(reg.transformation)
+        info = r.get_information_matrix_from_point_clouds(fine[a], fine[b], fine_dist, T)
+        return T, info, reg.fitness, reg.inlier_rmse
+
+    # 2) odometry edges (consecutive). source=i-1, target=i so T = cam_i <- cam_{i-1} matches
+    #    PoseGraphEdge(i-1, i, T). REJECT a wrong edge: the match-based rough is mostly right, but a
+    #    pair that locked onto the wrong repetitive surface yields an ICP that does not overlap the
+    #    dense clouds -> coast the last accepted motion (constant velocity) + add the edge uncertain
+    #    + down-weighted, letting loop closure recover it, rather than welding a frame on at a wrong
+    #    angle.
     pg = r.PoseGraph()
     pg.nodes.append(r.PoseGraphNode(np.eye(4)))
     w2c = np.eye(4)
     prev_T = np.eye(4)          # last accepted relative motion (constant-velocity coast)
     n_bad_odo = 0
     for i in range(1, n):
-        T, info, fit, _, _ = register(i - 1, i)
-        good = fit >= cfg.icp_min_fitness and float(np.linalg.norm(T[:3, 3])) <= cfg.icp_max_motion
+        T, info, fit, _ = register(i - 1, i)
+        good = (T is not None and fit >= cfg.icp_min_fitness
+                and float(np.linalg.norm(np.asarray(T)[:3, 3])) <= cfg.icp_max_motion)
         if good:
             prev_T = T
         else:
-            T, info, n_bad_odo = prev_T, info * 1e-2, n_bad_odo + 1
+            T, info, n_bad_odo = prev_T, np.eye(6) * 1e-2, n_bad_odo + 1
         w2c = T @ w2c
         pg.nodes.append(r.PoseGraphNode(np.linalg.inv(w2c)))
         pg.edges.append(r.PoseGraphEdge(i - 1, i, T, info, uncertain=not good))
     print(f"[moge3-sfm] {n - 1} odometry edges ({n_bad_odo} coasted — low overlap/motion)")
 
-    # 3) loop-closure edges from retrieval pairs, kept only when BOTH the RANSAC rough registration
-    #    is confident (rough_fit) AND the ICP agrees (fitness/rmse) — rejecting the wrong-wall loops.
+    # 3) loop-closure edges from retrieval pairs, kept only when the ICP overlap is confident
+    #    (fitness) with a tight residual (rmse) — rejecting the wrong-surface loops.
     n_loop = 0
     for a, b in pairs:
         ia, ib = name_to_idx[a], name_to_idx[b]
         if abs(ia - ib) <= cfg.sequential_window:
             continue
-        T, info, fit, rmse, rough_fit = register(ia, ib)
-        if (rough_fit < cfg.ransac_min_loop_fitness
-                or fit < cfg.icp_loop_min_fitness or rmse > cfg.icp_loop_max_rmse):
+        T, info, fit, rmse = register(ia, ib)
+        if T is None or fit < cfg.icp_loop_min_fitness or rmse > cfg.icp_loop_max_rmse:
             continue
         pg.edges.append(r.PoseGraphEdge(ia, ib, T, info, uncertain=True))
         n_loop += 1
     print(f"[moge3-sfm] {n_loop} loop-closure edges kept")
 
-    # 4) global optimization (robust line process closes loops + rejects bad edges). With reliable
-    #    RANSAC+ICP edges a single MODERATE mcd both closes loops and pulls surfaces to cm scale — no
-    #    scene-scaled looseness (which left ~1 m-thick surfaces) and no two-stage tightening (which
-    #    pruned real loops whose initial residual exceeds the tight mcd under drift).
+    # 4) global optimization (robust line process closes loops + rejects bad edges). With the
+    #    reliable match-based init the odometry drift is small, so a single MODERATE mcd both closes
+    #    loops and pulls surfaces to cm scale — no scene-scaled looseness (which left ~1 m-thick
+    #    surfaces) and no two-stage tightening (which pruned real loops under residual drift).
     mcd = float(max(3.0 * cfg.icp_voxel, 0.20))
     opt = r.GlobalOptimizationOption(max_correspondence_distance=mcd,
                                      edge_prune_threshold=cfg.posegraph_prune_threshold,

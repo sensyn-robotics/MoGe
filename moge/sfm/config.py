@@ -37,14 +37,10 @@ class MoGe3SfMConfig:
     coarse_voxel: float = 0.15         # metres — coarse downsample (~1-2k pts) for FPFH + RANSAC global reg
     icp_max_corr_dist: float = 0.30    # metres — ICP correspondence radius (coarse pass; fine = /6)
     icp_max_iter: int = 60
-    # icp-engine rough registration = Open3D RANSAC feature matching (FPFH), the global-registration
-    # tutorial's primary method, on the coarse clouds -> point-to-plane ICP refine. RANSAC's edge-length
-    # + distance correspondence checkers reject the geometrically-inconsistent matches that blind FGR
-    # accepted on repetitive room surfaces (the wrong-wall failure); confidence gates then reject the
-    # pairs that still can't register.
-    ransac_max_iter: int = 100000      # Open3D RANSACConvergenceCriteria max_iteration
-    ransac_confidence: float = 0.999   # ... and confidence (early stop)
-    ransac_min_loop_fitness: float = 0.10  # reject a LOOP pair whose RANSAC rough fitness is below this
+    # icp-engine rough registration = match-based 3D-3D: LightGlue matches lifted to MoGe metric 3D +
+    # RANSAC (solve_pose_ransac, threshold/min_pair_inliers below) -> point-to-plane ICP refine. The
+    # ICP-overlap gates (icp_min_fitness / icp_loop_min_fitness / icp_loop_max_rmse) reject the pairs
+    # that locked onto the wrong repetitive surface.
     icp_min_fitness: float = 0.30      # odometry edge below this overlap fitness -> low-weight + coast
     icp_max_motion: float = 1.00       # metres — odometry translation above this -> coast + down-weight
     scale_normalize: bool = True       # pin each MoGe cloud to a common scale (median depth) — MoGe's
