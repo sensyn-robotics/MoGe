@@ -38,17 +38,23 @@ class MoGe3SfMConfig:
     icp_max_corr_dist: float = 0.30    # metres — ICP correspondence radius (coarse pass; fine = /6)
     icp_max_iter: int = 60
     # icp-engine rough registration = match-based 3D-3D: LightGlue matches lifted to MoGe metric 3D +
-    # RANSAC (solve_pose_ransac, threshold/min_pair_inliers below) -> point-to-plane ICP refine. The
-    # ICP-overlap gates (icp_min_fitness / icp_loop_min_fitness / icp_loop_max_rmse) reject the pairs
-    # that locked onto the wrong repetitive surface.
-    icp_min_fitness: float = 0.30      # odometry edge below this overlap fitness -> low-weight + coast
-    icp_max_motion: float = 1.00       # metres — odometry translation above this -> coast + down-weight
+    # RANSAC (solve_pose_ransac, threshold/min_pair_inliers below) -> point-to-plane ICP refine.
+    # ODOMETRY reject condition (derived from the per-pair diagnostic): the capture is ~1 fps video,
+    # so a consecutive pair's motion/rotation MUST be small (measured: motion median 0.20 m, p90 0.45 m,
+    # rotation <=17 deg on all good pairs; the one wrong consecutive pair was 3.46 m / 171 deg). Gate on
+    # those physical priors, NOT on ICP fitness — fitness is inherently low on noisy MoGe clouds and a
+    # fitness gate rejects good low-overlap edges (it made the reconstruction worse, planarity 0.44).
+    icp_max_motion: float = 1.5        # metres — coast an odometry edge whose translation exceeds this
+    icp_max_rotation_deg: float = 40.0 # degrees — coast an odometry edge whose rotation exceeds this
     scale_normalize: bool = True       # pin each MoGe cloud to a common scale (median depth) — MoGe's
                                        # per-frame metric scale drifts, ballooning the rigid reconstruction
 
     # --- pose-graph loop closure + global optimization (icp engine) ---
+    # Loop pairs are wide-baseline (far apart in time) so the small-motion prior does NOT apply; keep a
+    # LOW fitness floor (drop only catastrophic garbage, e.g. fitness 0.01) + a tight rmse, so real loops
+    # survive (an aggressive 0.40 floor pruned ~40% of good loops and hurt the global solve).
     min_loop_inliers: int = 30         # 3D-3D match inliers required to attempt a loop edge
-    icp_loop_min_fitness: float = 0.40 # keep a loop edge only above this ICP overlap fitness
+    icp_loop_min_fitness: float = 0.20 # keep a loop edge only above this ICP overlap fitness
     icp_loop_max_rmse: float = 0.08    # metres — and below this ICP inlier RMSE (reject bad loops)
     posegraph_prune_threshold: float = 0.25  # Open3D line-process edge-prune threshold
     gravity_align: bool = True         # rotate the solved scene so averaged MoGe floor-normal = world up

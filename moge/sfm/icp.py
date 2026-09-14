@@ -11,13 +11,15 @@ directly, which gave the most planar reconstruction of any rough method tried. P
   2. RANSAC 3D-3D (rigid) on those correspondences -> rough relative pose (rejected if too few inliers),
   3. point-to-plane ICP on the fine clouds from that rough transform -> exact relative pose.
 
-REJECT WRONG PAIRS: the rough 3D-3D pose is mostly right but a minority of pairs lock onto the wrong
-repetitive surface (>30 deg off). Such a pose does not align the DENSE clouds, so it fails the ICP
-overlap gate: an odometry edge is coasted when its ICP fitness or motion is implausible, and a loop
-edge is kept only when the ICP agrees (fitness + rmse). Open3D global_optimization (robust line
-process) then closes loops + rejects the residual bad edges, and gravity-align rotates the scene so
-the averaged MoGe floor-normal points up. Rigid SE(3): MoGe-3 is metric, so per-frame scale is
-consistent and no scale DOF is needed."""
+REJECT WRONG PAIRS (thresholds derived from a per-pair diagnostic): the rough 3D-3D pose is mostly
+right but a minority of pairs lock onto the wrong repetitive surface. This capture is ~1 fps video,
+so a consecutive (odometry) pair's motion and rotation must be small — an odometry edge is coasted
+when its translation exceeds icp_max_motion (1.5 m) or its rotation exceeds icp_max_rotation_deg
+(40 deg), NOT on ICP fitness (fitness is inherently low on noisy MoGe clouds; gating on it rejects
+good low-overlap edges). Wide-baseline loop edges (no small-motion prior) are kept only above a LOW
+fitness floor + tight rmse. Open3D global_optimization (robust line process) then closes loops +
+rejects the residual bad edges, and gravity-align rotates the scene so the averaged MoGe floor-normal
+points up. Rigid SE(3): MoGe-3 is metric, so per-frame scale is consistent and no scale DOF is needed."""
 
 from __future__ import annotations
 
@@ -161,8 +163,14 @@ def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3
     n_bad_odo = 0
     for i in range(1, n):
         T, info, fit, _ = register(i - 1, i)
-        good = (T is not None and fit >= cfg.icp_min_fitness
-                and float(np.linalg.norm(np.asarray(T)[:3, 3])) <= cfg.icp_max_motion)
+        # 1 fps -> consecutive motion/rotation must be small; a pair that locked onto the wrong
+        # surface shows up as an implausible jump. Gate on those physical priors (not ICP fitness).
+        if T is not None:
+            Ta = np.asarray(T)
+            motion = float(np.linalg.norm(Ta[:3, 3]))
+            rot_deg = float(np.degrees(np.arccos(np.clip((np.trace(Ta[:3, :3]) - 1) / 2, -1, 1))))
+        good = (T is not None and motion <= cfg.icp_max_motion
+                and rot_deg <= cfg.icp_max_rotation_deg)
         if good:
             prev_T = T
         else:
@@ -170,7 +178,7 @@ def _icp_posegraph(image_paths, kpts, matches_h5, pairs, name_to_idx, cfg: MoGe3
         w2c = T @ w2c
         pg.nodes.append(r.PoseGraphNode(np.linalg.inv(w2c)))
         pg.edges.append(r.PoseGraphEdge(i - 1, i, T, info, uncertain=not good))
-    print(f"[moge3-sfm] {n - 1} odometry edges ({n_bad_odo} coasted — low overlap/motion)")
+    print(f"[moge3-sfm] {n - 1} odometry edges ({n_bad_odo} coasted — implausible motion/rotation)")
 
     # 3) loop-closure edges from retrieval pairs, kept only when the ICP overlap is confident
     #    (fitness) with a tight residual (rmse) — rejecting the wrong-surface loops.
